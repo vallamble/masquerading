@@ -1,19 +1,17 @@
-# Déploiement navi (Docker + Portainer). cloudflared tourne sur navi et cible
-# localhost:8080 → on n'expose le port que sur la loopback. Le volume sanitizer_data
-# est EXTERNE (déjà créé, contient /data/mapping_by_value.csv).
+# Déploiement navi (Docker Swarm + Portainer), exposé via Traefik.
+# Traefik (mode Swarm, réseau traefik_public, entrypoint websecure, resolver "le")
+# termine le TLS et route Host(sanitizer.lamble.fr) → conteneur:8080.
+# Pas de port publié sur l'hôte : le trafic passe uniquement par Traefik
+# (LAN via Pi-hole → navi:443 ; Internet via le tunnel Cloudflare → Traefik).
 services:
   sanitizer:
     image: ghcr.io/vallamble/sanitizer:latest
-    container_name: sanitizer
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:8080:8080"
     volumes:
       - sanitizer_data:/data
     environment:
       # --- Auth du service (header X-Api-Key attendu des workflows Securiti) ---
       SERVICE_API_KEY: "${SERVICE_API_KEY}"
-      # --- Microsoft Graph app-only (app Entra Sites.Selected) ---
+      # --- Microsoft Graph app-only (app Entra Sites.Selected sur le site racine) ---
       GRAPH_TENANT_ID: "${GRAPH_TENANT_ID}"
       GRAPH_CLIENT_ID: "${GRAPH_CLIENT_ID}"
       GRAPH_CLIENT_SECRET: "${GRAPH_CLIENT_SECRET}"
@@ -31,7 +29,26 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+    networks:
+      - traefik_public
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.sanitizer.rule=Host(`sanitizer.lamble.fr`)"
+        - "traefik.http.routers.sanitizer.entrypoints=websecure"
+        - "traefik.http.routers.sanitizer.tls=true"
+        - "traefik.http.routers.sanitizer.tls.certresolver=le"
+        # En mode Swarm, le port cible du conteneur est obligatoire en label.
+        - "traefik.http.services.sanitizer.loadbalancer.server.port=8080"
 
 volumes:
   sanitizer_data:
+    external: true
+
+networks:
+  traefik_public:
     external: true
