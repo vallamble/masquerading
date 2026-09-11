@@ -1,0 +1,37 @@
+# Déploiement navi (Docker + Portainer). cloudflared tourne sur navi et cible
+# localhost:8080 → on n'expose le port que sur la loopback. Le volume sanitizer_data
+# est EXTERNE (déjà créé, contient /data/mapping_by_value.csv).
+services:
+  sanitizer:
+    image: ghcr.io/vallamble/sanitizer:latest
+    container_name: sanitizer
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - sanitizer_data:/data
+    environment:
+      # --- Auth du service (header X-Api-Key attendu des workflows Securiti) ---
+      SERVICE_API_KEY: "${SERVICE_API_KEY}"
+      # --- Microsoft Graph app-only (app Entra Sites.Selected) ---
+      GRAPH_TENANT_ID: "${GRAPH_TENANT_ID}"
+      GRAPH_CLIENT_ID: "${GRAPH_CLIENT_ID}"
+      GRAPH_CLIENT_SECRET: "${GRAPH_CLIENT_SECRET}"
+      # --- Cible SharePoint (site racine du tenant → SP_SITE_PATH vide) ---
+      SP_HOSTNAME: "m365x42057173.sharepoint.com"
+      SP_SITE_PATH: ""
+      SP_LIBRARY: "Documents"
+      # --- Chemins d'état (le volume contient déjà /data/mapping_by_value.csv) ---
+      DATA_DIR: "/data"
+      INBOUND_PREFIX: "Inbound"
+      OUTPUT_PREFIX: "Output"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  sanitizer_data:
+    external: true
