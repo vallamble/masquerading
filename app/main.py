@@ -11,11 +11,14 @@ Endpoints :
   POST /sanitize        {"file_path": "Inbound/x.docx"}  — un fichier
   POST /scan-completed  {"scan_id": "..."}               — tout Inbound
   GET  /healthz
+  GET  /mapping         table de correspondance original→pseudonyme (HTML, ?format=json)
 
 Auth : header X-Api-Key == $SERVICE_API_KEY (les POST seulement).
 État : /data (PVC) — table de pseudonymes persistante (mapping_by_value.csv
 copiée au premier démarrage + generated.json pour les valeurs HMAC inconnues).
 """
+import csv
+import html
 import json
 import logging
 import os
@@ -25,6 +28,7 @@ import tempfile
 import threading
 
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 import sanitize_reference as sr
@@ -178,6 +182,65 @@ class ScanReq(BaseModel):
 @app.get("/healthz")
 def healthz():
     return {"status": "ok", "queue": jobs.qsize(), **state}
+
+
+def _load_mapping():
+    """Lit la table de pseudonymes (CSV persistant + generated.json runtime).
+    Retourne une liste de (data_type, original, pseudonyme, source)."""
+    rows = []
+    seen = set()
+    path = MAPPING if os.path.exists(MAPPING) else SEED_MAPPING
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                orig = r.get("original_value", "")
+                rows.append((r.get("data_type", ""), orig, r.get("replacement_value", ""), "table"))
+                seen.add(orig)
+    if os.path.exists(GENERATED):
+        try:
+            with open(GENERATED, encoding="utf-8") as f:
+                for k, v in json.load(f).items():
+                    if k not in seen:
+                        rows.append(("(généré)", k, v, "runtime"))
+        except Exception:
+            pass
+    return rows
+
+
+@app.get("/mapping", response_class=HTMLResponse)
+def mapping(format: str = "html"):
+    """Publie la table de correspondance masquage original → pseudonyme (lab, sans auth)."""
+    rows = _load_mapping()
+    if format == "json":
+        return JSONResponse([
+            {"data_type": dt, "original_value": o, "replacement_value": p, "source": s}
+            for dt, o, p, s in rows
+        ])
+    body = "\n".join(
+        f"<tr><td>{html.escape(dt)}</td><td>{html.escape(o)}</td>"
+        f"<td class='p'>{html.escape(p)}</td><td class='s'>{html.escape(s)}</td></tr>"
+        for dt, o, p, s in rows
+    )
+    page = f"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<title>Masquerading — table de correspondance</title>
+<style>
+ body{{font:14px/1.4 system-ui,sans-serif;margin:2rem;color:#1a1a2e}}
+ h1{{font-size:1.2rem}} .n{{color:#667;margin-bottom:1rem}}
+ input{{padding:.4rem .6rem;margin-bottom:1rem;width:20rem;border:1px solid #ccd;border-radius:6px}}
+ table{{border-collapse:collapse;width:100%}} th,td{{padding:.35rem .6rem;border-bottom:1px solid #eef;text-align:left;font-variant-numeric:tabular-nums}}
+ th{{position:sticky;top:0;background:#f5f6ff}} td.p{{color:#0a7d34;font-weight:600}} td.s{{color:#889;font-size:.85em}}
+ tr:hover{{background:#fafbff}}
+</style></head><body>
+<h1>Masquerading — table de correspondance (masquage signifiant)</h1>
+<div class="n">{len(rows)} entrées · données 100 % fictives (lab) · original → pseudonyme cohérent</div>
+<input id="q" placeholder="filtrer… (nom, IBAN, type)" oninput="f()">
+<table><thead><tr><th>Type</th><th>Valeur d'origine</th><th>Pseudonyme</th><th>Source</th></tr></thead>
+<tbody id="t">{body}</tbody></table>
+<script>
+ function f(){{var v=document.getElementById('q').value.toLowerCase();
+  document.querySelectorAll('#t tr').forEach(function(r){{r.style.display=r.innerText.toLowerCase().includes(v)?'':'none'}});}}
+</script></body></html>"""
+    return HTMLResponse(page)
 
 
 @app.post("/sanitize", status_code=202)
