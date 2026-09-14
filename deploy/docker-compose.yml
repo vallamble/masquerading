@@ -1,13 +1,13 @@
 # Déploiement navi (Docker Swarm + Portainer), exposé via Traefik.
 # Traefik (mode Swarm, réseau traefik_public, entrypoint websecure, resolver "le")
-# termine le TLS et route Host(sanitizer.lamble.fr) → conteneur:8080.
+# termine le TLS et route Host(masquerading.lamble.fr) → conteneur:8080.
 # Pas de port publié sur l'hôte : le trafic passe uniquement par Traefik
 # (LAN via Pi-hole → navi:443 ; Internet via le tunnel Cloudflare → Traefik).
 services:
-  sanitizer:
-    image: ghcr.io/vallamble/sanitizer:latest
+  masquerading:
+    image: ghcr.io/vallamble/masquerading:latest
     volumes:
-      - sanitizer_data:/data
+      - masquerading_data:/data
     environment:
       # --- Auth du service (header X-Api-Key attendu des workflows Securiti) ---
       SERVICE_API_KEY: "${SERVICE_API_KEY}"
@@ -38,15 +38,15 @@ services:
         condition: on-failure
       labels:
         - "traefik.enable=true"
-        - "traefik.http.routers.sanitizer.rule=Host(`sanitizer.lamble.fr`)"
-        - "traefik.http.routers.sanitizer.entrypoints=websecure"
-        - "traefik.http.routers.sanitizer.tls=true"
-        - "traefik.http.routers.sanitizer.tls.certresolver=le"
+        - "traefik.http.routers.masquerading.rule=Host(`masquerading.lamble.fr`)"
+        - "traefik.http.routers.masquerading.entrypoints=websecure"
+        - "traefik.http.routers.masquerading.tls=true"
+        - "traefik.http.routers.masquerading.tls.certresolver=le"
         # En mode Swarm, le port cible du conteneur est obligatoire en label.
-        - "traefik.http.services.sanitizer.loadbalancer.server.port=8080"
+        - "traefik.http.services.masquerading.loadbalancer.server.port=8080"
 
 volumes:
-  sanitizer_data:
+  masquerading_data:
     external: true
 
 networks:

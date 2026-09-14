@@ -31,7 +31,7 @@ import sanitize_reference as sr
 from graph import GraphClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("sanitizer")
+log = logging.getLogger("masquerading")
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 MAPPING = os.path.join(DATA_DIR, "mapping_by_value.csv")
@@ -41,7 +41,7 @@ INBOUND = os.environ.get("INBOUND_PREFIX", "Inbound")
 OUTPUT = os.environ.get("OUTPUT_PREFIX", "Output")
 API_KEY = os.environ.get("SERVICE_API_KEY", "")
 
-app = FastAPI(title="sanitizer", version="0.1.0")
+app = FastAPI(title="masquerading", version="0.1.0")
 jobs: "queue.Queue[dict]" = queue.Queue()
 state = {"processed": 0, "errors": 0, "last": None}
 

@@ -1,4 +1,4 @@
-# sanitizer
+# masquerading
 
 Service HTTP de **sanitization signifiante** pour un POC Securiti × SharePoint : il
 pseudonymise de façon cohérente (mêmes personnes → mêmes pseudonymes, IBAN/AVS/cartes de
@@ -39,18 +39,18 @@ Graph n'échoue que dans le worker au moment du traitement.
 
 ## Image
 
-`ghcr.io/vallamble/sanitizer:latest` (et `:sha-<court>`), multi-arch `linux/amd64,linux/arm64`,
+`ghcr.io/vallamble/masquerading:latest` (et `:sha-<court>`), multi-arch `linux/amd64,linux/arm64`,
 construite par GitHub Actions (`.github/workflows/build.yml`) sur `python:3.11-slim` +
 `tesseract-ocr` (fra/deu) + `fonts-dejavu-core`. Écoute `0.0.0.0:8080`.
 
 ## Déploiement (Docker / Portainer sur navi)
 
 `deploy/docker-compose.yml` : mappe `127.0.0.1:8080:8080` (cloudflared cible localhost:8080),
-volume externe `sanitizer_data` monté sur `/data`, healthcheck `curl /healthz`,
+volume externe `masquerading_data` monté sur `/data`, healthcheck `curl /healthz`,
 `restart: unless-stopped`. Copier `deploy/.env.example` → `.env` et remplir.
 
 ```bash
-docker pull ghcr.io/vallamble/sanitizer:latest
+docker pull ghcr.io/vallamble/masquerading:latest
 cd deploy && cp .env.example .env   # puis renseigner les secrets
 docker compose up -d
 ```

@@ -15,7 +15,7 @@ COPY app/ /app/
 # Table de pseudonymes de départ (copiée vers /data au 1er démarrage si absente).
 COPY seed/ /app/seed/
 
-RUN useradd -u 10001 -m sanitizer
+RUN useradd -u 10001 -m masquerading
 USER 10001
 
 EXPOSE 8080
