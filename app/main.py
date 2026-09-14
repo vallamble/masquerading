@@ -1,4 +1,4 @@
-"""Service de sanitization signifiante — POC Securiti × SharePoint.
+"""Service de masquerading (masquage signifiant) — POC Securiti × SharePoint.
 
 Reçoit les déclenchements des Workflows Securiti (nœud HTTP Request, exécuté
 depuis le cloud Securiti) et pseudonymise les fichiers de Documents/Inbound

@@ -1,65 +1,84 @@
 # masquerading
 
-Service HTTP de **sanitization signifiante** pour un POC Securiti × SharePoint : il
-pseudonymise de façon cohérente (mêmes personnes → mêmes pseudonymes, IBAN/AVS/cartes de
-format valide, images réécrites par OCR) les fichiers déposés dans `Documents/Inbound` d'un
-SharePoint et écrit le résultat dans `Documents/Output`. Données de test 100 % fictives.
+HTTP service for **meaningful masking / pseudonymization** in a Securiti × SharePoint PoC.
+It consistently pseudonymizes files dropped in a SharePoint `Documents/Inbound` folder — same
+people → same pseudonyms, format-valid IBAN/AVS/cards, in-image text rewritten via OCR — and
+writes the result to `Documents/Output`. All test data is 100 % fictional.
 
-Déclenché par les Workflows Securiti (nœud HTTP Request, exécuté dans le cloud Securiti) :
-scan SDI sur `Inbound` → policy File Insights → workflow → ce service → scan de vérification.
+Triggered by Securiti Workflows (HTTP Request node, executed in the Securiti cloud):
+SDI scan on `Inbound` → File Insights policy → workflow → this service → verification scan.
 
 ## Endpoints
 
-| Méthode | Chemin | Corps | Rôle |
+| Method | Path | Body | Purpose |
 |---|---|---|---|
-| GET | `/healthz` | — | état + profondeur de file |
-| POST | `/sanitize` | `{"file_path":"…"}` **ou** `{"alert":{…}}` | pseudonymise un fichier (202, asynchrone) |
-| POST | `/scan-completed` | `{"scan_id":"…"}` (ou `{"scan":{…}}`) | re-traite tout `Inbound` (202) |
+| GET | `/healthz` | — | status + queue depth |
+| POST | `/sanitize` | `{"file_path":"…"}` **or** `{"alert":{…}}` | pseudonymize one file (202, async) |
+| POST | `/scan-completed` | `{"scan_id":"…"}` (or `{"scan":{…}}`) | re-process all of `Inbound` (202) |
 
-`POST /sanitize` accepte soit un `file_path` direct, soit le payload brut d'alerte Securiti
-(`alert`) dont il extrait le chemin ; le payload reçu est loggé (utile pour capturer le schéma).
-Les POST exigent le header `X-Api-Key: $SERVICE_API_KEY`.
+`POST /sanitize` accepts either a direct `file_path` or the raw Securiti alert payload
+(`alert`), from which it extracts the path; the received payload is logged (handy to capture the
+schema). POST requests require the `X-Api-Key: $SERVICE_API_KEY` header.
 
-## Variables d'environnement
+## Environment variables
 
-| Variable | Rôle | Défaut |
+| Variable | Purpose | Default |
 |---|---|---|
-| `SERVICE_API_KEY` | clé attendue dans `X-Api-Key` | — (obligatoire) |
-| `GRAPH_TENANT_ID` / `GRAPH_CLIENT_ID` / `GRAPH_CLIENT_SECRET` | app Entra (Sites.Selected) | — |
-| `SP_HOSTNAME` | hôte SharePoint | — |
-| `SP_SITE_PATH` | chemin du site (`""` = site racine) | — |
-| `SP_LIBRARY` | bibliothèque de documents | `Documents` |
-| `DATA_DIR` | dossier d'état (mapping + pseudonymes générés) | `/data` |
-| `INBOUND_PREFIX` / `OUTPUT_PREFIX` | dossiers source/cible | `Inbound` / `Output` |
+| `SERVICE_API_KEY` | key expected in `X-Api-Key` | — (required) |
+| `GRAPH_TENANT_ID` / `GRAPH_CLIENT_ID` / `GRAPH_CLIENT_SECRET` | Entra app (Sites.ReadWrite.All or Sites.Selected) | — |
+| `SP_HOSTNAME` | SharePoint host | — |
+| `SP_SITE_PATH` | site path (`""` = tenant root site) | — |
+| `SP_LIBRARY` | document library | `Documents` |
+| `DATA_DIR` | state dir (mapping + generated pseudonyms) | `/data` |
+| `INBOUND_PREFIX` / `OUTPUT_PREFIX` | source/target folders | `Inbound` / `Output` |
+| `SANITIZE_FONT` | force the "sans" TrueType font path (optional) | auto-detected |
+| `COVER_UNREAD_INK` | `1` = auto-cover ink zones OCR can't read (experimental) | `0` |
 
-État persistant : `${DATA_DIR}/mapping_by_value.csv` (table de pseudonymes ; graine copiée
-au 1er démarrage si absente) et `${DATA_DIR}/generated.json` (valeurs inconnues, dérivation
-déterministe). Le service démarre **sans** credentials Graph (répond 202 et logge), l'appel
-Graph n'échoue que dans le worker au moment du traitement.
+Persistent state: `${DATA_DIR}/mapping_by_value.csv` (pseudonym table; seed copied on first
+start if missing) and `${DATA_DIR}/generated.json` (unknown values, deterministic derivation).
+The service starts **without** Graph credentials (returns 202 and logs); the Graph call only
+fails inside the worker at processing time.
+
+## How masking works
+
+- **Documents** (DOCX/XLSX/PDF): text is matched against the pseudonym table + deterministic
+  patterns (IBAN mod-97, AVS EAN-13, Luhn cards, patient IDs, emails, phones) and replaced with
+  format-valid pseudonyms — no `XXXX` placeholders.
+- **Images** (PNG/JPG + images embedded in PDF/DOCX): OCR at two scales (2× LANCZOS then 1×) ×
+  two page-segmentation modes, with numeric-token normalization (O/0, I/1, S/5…) so a misread
+  digit can't hide an identifier. **Fail-closed**: any IBAN-shaped string whose checksum is
+  doubtful is matched to the table (Levenshtein ≤ 2) or replaced by a generated IBAN — never left
+  in clear. Low-confidence names/addresses are matched to the table (distance ≤ 1). Rendering
+  fits the pseudonym to the box and picks a DejaVu family (sans/bold/mono/serif/condensed) by
+  minimal width error. Ink zones OCR can't read at all (signatures, handwriting) are scored as
+  `UNREAD_INK` in the log for manual review.
 
 ## Image
 
-`ghcr.io/vallamble/masquerading:latest` (et `:sha-<court>`), multi-arch `linux/amd64,linux/arm64`,
-construite par GitHub Actions (`.github/workflows/build.yml`) sur `python:3.11-slim` +
-`tesseract-ocr` (fra/deu) + `fonts-dejavu-core`. Écoute `0.0.0.0:8080`.
+`ghcr.io/vallamble/masquerading:latest` (and `:sha-<short>`), multi-arch `linux/amd64,linux/arm64`,
+built by GitHub Actions (`.github/workflows/build.yml`) on `python:3.11-slim` + `tesseract-ocr`
+(fra/deu) + `fonts-dejavu` (sans/bold/mono/serif/condensed). Listens on `0.0.0.0:8080`.
 
-## Déploiement (Docker / Portainer sur navi)
+## Deployment (Docker / Portainer, behind Traefik)
 
-`deploy/docker-compose.yml` : mappe `127.0.0.1:8080:8080` (cloudflared cible localhost:8080),
-volume externe `masquerading_data` monté sur `/data`, healthcheck `curl /healthz`,
-`restart: unless-stopped`. Copier `deploy/.env.example` → `.env` et remplir.
+`deploy/docker-compose.yml` runs the service in Docker Swarm and exposes it through **Traefik**
+(external network `traefik_public`, `websecure` entrypoint, Let's Encrypt resolver `le`,
+router `Host(masquerading.lamble.fr)` → container `:8080`). No host port is published (traffic
+goes through Traefik; internet access via a Cloudflare tunnel pointing at Traefik). The
+`masquerading_data` volume is **external** and holds `/data`. Copy `deploy/.env.example` → `.env`
+and fill it (or set the variables in the Portainer stack).
 
 ```bash
 docker pull ghcr.io/vallamble/masquerading:latest
-cd deploy && cp .env.example .env   # puis renseigner les secrets
-docker compose up -d
+cd deploy && cp .env.example .env   # then fill in the secrets
+docker stack deploy -c docker-compose.yml masquerading   # or deploy via Portainer
 ```
 
-## Test rapide
+## Quick test
 
 ```bash
-curl -fsS http://localhost:8080/healthz
-curl -fsS -XPOST http://localhost:8080/sanitize \
+curl -fsS https://masquerading.lamble.fr/healthz
+curl -fsS -XPOST https://masquerading.lamble.fr/sanitize \
   -H "X-Api-Key: $SERVICE_API_KEY" -H 'Content-Type: application/json' \
-  -d '{"file_path":"Inbound/Dossier_patients_Q3_2026_FICTIF.pdf"}'
+  -d '{"file_path":"Documents/Inbound/Dossier_patients_Q3_2026_FICTIF.pdf"}'
 ```
