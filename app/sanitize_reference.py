@@ -596,10 +596,119 @@ def _cover_unread_ink(img, words, done_boxes, apply=False):
 
 
 # ---------------------------------------------------------------------------
-def sanitize_docx(src, dst, pz, strict):
+# ---------------------------------------------------------------------------
+# Objets imbriqués (OLE / package / pièces jointes) : routage récursif par extension, fail-closed sinon
+# ---------------------------------------------------------------------------
+MAX_EMBED_DEPTH = 3
+_OLE_PREVIEW_EXT = (".emf", ".wmf")
+
+
+def _route_embedded(name, data, pz, strict, depth, seen):
+    """Traite un objet imbriqué (octets) : retourne (nouveaux octets ou None, entrée de log).
+    .xlsx/.docx -> sanitize_xlsx/sanitize_docx (récursif, profondeur max, garde anti-boucle par empreinte) ;
+    .bin (OLE compound) -> si un package Office est encapsulé, on l'extrait et on le traite, sinon EMBEDDED_UNSUPPORTED.
+    Un objet non traité est toujours journalisé + marqué pour revue (jamais ignoré en silence)."""
+    import hashlib as _h
+    ext = os.path.splitext(name)[1].lower()
+    fp = _h.sha256(data).hexdigest()[:16]
+    entry = {"object": name, "bytes": len(data), "ext": ext, "depth": depth}
+    if fp in seen:
+        entry.update(status="skipped_loop", reason="objet déjà rencontré (garde anti-boucle)")
+        return None, entry
+    seen.add(fp)
+    if depth > MAX_EMBED_DEPTH:
+        entry.update(status="unsupported", type="EMBEDDED_UNSUPPORTED", reason="profondeur > %d" % MAX_EMBED_DEPTH, review=True)
+        return None, entry
+    handler = {".xlsx": sanitize_xlsx, ".xlsm": sanitize_xlsx, ".docx": sanitize_docx, ".docm": sanitize_docx}.get(ext)
+    if handler is None and ext == ".bin":
+        inner = _ole_extract_package(data)
+        if inner:
+            inner_name, inner_data = inner
+            new, sub = _route_embedded(inner_name, inner_data, pz, strict, depth, seen)
+            entry.update(status=sub.get("status"), ole_package=inner_name, inner=sub)
+            if new is not None:
+                new = _ole_replace_package(data, new)
+                if new is None:
+                    entry.update(status="unsupported", type="EMBEDDED_UNSUPPORTED", review=True,
+                                 reason="package Office traité mais réécriture OLE impossible")
+            return new, entry
+        entry.update(status="unsupported", type="EMBEDDED_UNSUPPORTED", review=True,
+                     reason="OLE compound sans package Office reconnu (ou olefile absent)")
+        return None, entry
+    if handler is None:
+        entry.update(status="unsupported", type="EMBEDDED_UNSUPPORTED", review=True, reason="extension non gérée")
+        return None, entry
+    tmpd = tempfile.mkdtemp(prefix="emb_")
+    try:
+        src = os.path.join(tmpd, "in" + ext); dst = os.path.join(tmpd, "out" + ext)
+        with open(src, "wb") as f:
+            f.write(data)
+        res = handler(src, dst, pz, strict, _depth=depth + 1, _seen=seen) if ext in (".docx", ".docm") else handler(src, dst, pz, strict)
+        with open(dst, "rb") as f:
+            new = f.read()
+        n_txt = len(res.get("text_replacements", []))
+        n_img = sum(len(i["replacements"]) for i in res.get("images", []))
+        entry.update(status="processed", replacements=n_txt + n_img, embedded=res.get("embedded"))
+        if res.get("review"):
+            entry["review"] = res["review"]
+        return new, entry
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+
+
+def _ole_extract_package(data):
+    """OLE compound (.bin) : renvoie (nom, octets) du package Office encapsulé (flux « Package » = OOXML zip), sinon None."""
+    try:
+        import olefile
+    except ImportError:
+        return None
+    try:
+        if not olefile.isOleFile(io.BytesIO(data)):
+            return None
+        ole = olefile.OleFileIO(io.BytesIO(data))
+        for stream in (["Package"], ["package"]):
+            if ole.exists("/".join(stream)):
+                blob = ole.openstream(stream).read()
+                if blob[:2] == b"PK":
+                    with zipfile.ZipFile(io.BytesIO(blob)) as z:
+                        names = z.namelist()
+                    ext = ".xlsx" if any(n.startswith("xl/") for n in names) else ".docx" if any(n.startswith("word/") for n in names) else ""
+                    return ("package" + ext, blob) if ext else None
+        return None
+    except Exception:
+        return None
+
+
+def _ole_replace_package(data, new_blob):
+    """Réécrit le flux Package d'un OLE compound (même taille ou inférieure : olefile écrit en place ; sinon None)."""
+    try:
+        import olefile
+        ole = olefile.OleFileIO(io.BytesIO(data), write_mode=True)
+        for stream in (["Package"], ["package"]):
+            if ole.exists("/".join(stream)):
+                size = ole.get_size("/".join(stream))
+                if len(new_blob) > size:
+                    return None                         # olefile ne sait pas agrandir un flux
+                ole.write_stream("/".join(stream), new_blob + b"\x00" * (size - len(new_blob)))
+                ole.close()
+                return ole.fp.getvalue()
+    except Exception:
+        return None
+    return None
+
+
+def _embedded_summary(entries):
+    return {"found": [e["object"] for e in entries],
+            "processed": [e["object"] for e in entries if e.get("status") == "processed"],
+            "unsupported": [e["object"] for e in entries if e.get("status") not in ("processed",)],
+            "details": entries}
+
+
+def sanitize_docx(src, dst, pz, strict, _depth=0, _seen=None):
     from docx import Document
     d = Document(src)
     log = []
+    seen = _seen if _seen is not None else set()
 
     def fix_paragraph(p):
         full = p.text
@@ -624,17 +733,46 @@ def sanitize_docx(src, dst, pz, strict):
             fix_paragraph(p)
     tmp = dst + ".tmp.docx"
     d.save(tmp)
-    # images incorporées
-    img_log = []
+    # images incorporées + objets imbriqués (word/embeddings/*) + aperçus d'objets (EMF/WMF : non OCRisables -> revue)
+    img_log, emb_log, review = [], [], []
+    # python-docx ne réécrit que les parties reliées : un objet présent dans la source mais absent après sauvegarde
+    # est signalé (perte de contenu silencieuse sinon)
+    with zipfile.ZipFile(src) as zsrc, zipfile.ZipFile(tmp) as ztmp:
+        dropped = [n for n in zsrc.namelist() if n.startswith("word/embeddings/") and n not in ztmp.namelist()]
+    if dropped:
+        review.append({"type": "EMBEDDED_DROPPED_BY_PYTHON_DOCX", "objects": dropped,
+                       "hint": "objet sans relation dans document.xml.rels : absent de la sortie (pas de fuite, perte de contenu)"})
+        emb_log += [{"object": n, "status": "dropped", "reason": "non relié, perdu à la sauvegarde"} for n in dropped]
     with zipfile.ZipFile(tmp) as zin, zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
         for item in zin.infolist():
             data = zin.read(item.filename)
-            if item.filename.startswith("word/media/") and item.filename.lower().endswith((".png", ".jpg", ".jpeg")):
+            low = item.filename.lower()
+            if item.filename.startswith("word/media/") and low.endswith((".png", ".jpg", ".jpeg")):
                 data, l = sanitize_image_bytes(data, os.path.splitext(item.filename)[1], pz, strict)
                 img_log.append({"media": item.filename, "replacements": l})
+            elif item.filename.startswith("word/media/") and low.endswith(_OLE_PREVIEW_EXT):
+                # l'aperçu Word d'un objet Excel imbriqué montre les valeurs EN CLAIR ; un métafichier n'est ni OCRisé
+                # ni réécrit ici -> fail-closed : signalé pour revue (l'objet lui-même est traité ci-dessous)
+                review.append({"type": "EMBEDDED_PREVIEW_UNSUPPORTED", "media": item.filename,
+                               "hint": "aperçu EMF/WMF d'un objet imbriqué : valeurs potentiellement en clair, non traité"})
+            elif item.filename.startswith("word/embeddings/"):
+                new, e = _route_embedded(item.filename, data, pz, strict, _depth, seen)
+                emb_log.append(e)
+                if new is not None:
+                    data = new
+                    item = zipfile.ZipInfo(item.filename, date_time=item.date_time); item.compress_type = zipfile.ZIP_DEFLATED
+                else:
+                    review.append({"type": e.get("type", "EMBEDDED_UNSUPPORTED"), "object": item.filename, "reason": e.get("reason")})
             zout.writestr(item, data)
     os.unlink(tmp)
-    return {"text_replacements": log, "images": img_log}
+    res = {"text_replacements": log, "images": img_log}
+    if emb_log:
+        res["embedded"] = _embedded_summary(emb_log)
+    if review:
+        res["review"] = review
+    return res
+
+
 # ---------------------------------------------------------------------------
 # RTF : conversion LibreOffice (RTF -> DOCX -> sanitize_docx -> RTF). Variante « native » (parser les mots de
 # contrôle RTF et patcher les runs en place) = cible production, non codée ici (voir RAPPORT gap customer).
@@ -756,7 +894,38 @@ def sanitize_xlsx(src, dst, pz, strict):
                             e["cell"] = "%s!%s" % (ws.title, c.coordinate)
                         log.extend(l)
     wb.save(dst)
-    return {"text_replacements": log}
+    res = {"text_replacements": log}
+    # objets imbriqués dans un classeur (xl/embeddings/*) : openpyxl ne les conserve pas tous ; on relit la SOURCE
+    # et on réinjecte les objets traités dans la sortie (fail-closed : un objet non traité est signalé).
+    with zipfile.ZipFile(src) as zsrc:
+        emb_names = [n for n in zsrc.namelist() if n.startswith("xl/embeddings/")]
+        emb_data = {n: zsrc.read(n) for n in emb_names}
+    if emb_names:
+        emb_log, review = [], []
+        with zipfile.ZipFile(dst) as zin:
+            present = set(zin.namelist())
+        for n in emb_names:
+            new, e = _route_embedded(n, emb_data[n], pz, strict, 0, set())
+            emb_log.append(e)
+            if new is None:
+                review.append({"type": e.get("type", "EMBEDDED_UNSUPPORTED"), "object": n, "reason": e.get("reason")})
+            emb_data[n] = new
+        if any(v is not None for v in emb_data.values()) and all(n in present for n in emb_names):
+            tmp = dst + ".tmp.xlsx"
+            with zipfile.ZipFile(dst) as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    data = zin.read(item.filename)
+                    if item.filename in emb_data and emb_data[item.filename] is not None:
+                        data = emb_data[item.filename]
+                    zout.writestr(item, data)
+            shutil.move(tmp, dst)
+        elif not all(n in present for n in emb_names):
+            review.append({"type": "EMBEDDED_DROPPED_BY_OPENPYXL", "objects": [n for n in emb_names if n not in present],
+                           "hint": "openpyxl n'a pas conservé l'objet : absent de la sortie (pas de fuite, mais perte de contenu)"})
+        res["embedded"] = _embedded_summary(emb_log)
+        if review:
+            res["review"] = review
+    return res
 
 
 def _pdf_line_matches(page, pz, strict, fitz):
@@ -1163,8 +1332,28 @@ def sanitize_pdf(src, dst, pz, strict):
                 img_log.append({"page": page.number + 1, "xref": xref, "replacements": l})
     # garbage=4 + clean : supprime les objets devenus orphelins après replace_image (l'ancienne image comptait
     # encore dans le PDF de sortie — anomalie « 8 images au lieu de 4 »). À recouper avec `pdfimages -list`.
+    # pièces jointes (embedded files) : extraites, routées par extension, réécrites (embfile_upd) ; inconnues -> revue
+    emb_log, review = [], []
+    for name in list(doc.embfile_names()):
+        info = doc.embfile_info(name)
+        fname = info.get("filename") or info.get("name") or name
+        data = doc.embfile_get(name)
+        new, e = _route_embedded(fname, data, pz, strict, 0, set())
+        emb_log.append(e)
+        if new is not None:
+            # PyMuPDF 1.28 : embfile_upd(buffer_=bytes) plante (« bytes has no m_internal ») -> suppression + réinsertion
+            doc.embfile_del(name)
+            doc.embfile_add(name, new, filename=info.get("filename") or fname, ufilename=info.get("ufilename") or fname,
+                            desc=info.get("desc") or "")
+        else:
+            review.append({"type": e.get("type", "EMBEDDED_UNSUPPORTED"), "object": fname, "reason": e.get("reason")})
     doc.save(dst, garbage=4, clean=True, deflate=True)
-    return {"text_replacements": log, "images": img_log}
+    res = {"text_replacements": log, "images": img_log, "pages": pages_log}
+    if emb_log:
+        res["embedded"] = _embedded_summary(emb_log)
+    if review:
+        res["review"] = review
+    return res
 
 
 def sanitize_image_file(src, dst, pz, strict):
