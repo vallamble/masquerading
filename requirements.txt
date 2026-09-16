@@ -7,3 +7,5 @@ openpyxl==3.1.*
 pillow==10.*
 pytesseract==0.3.*
 numpy==1.26.*
+olefile==0.47.*
+striprtf==0.0.*

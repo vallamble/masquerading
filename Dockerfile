@@ -1,11 +1,17 @@
 # Service de masquerading (masquage signifiant) (POC Securiti × SharePoint).
-# fonts-dejavu (core+extra) est indispensable : familles sans/bold/mono/serif/condensed : la réécriture d'images (OCR) charge
-# DejaVuSans.ttf — python:3.11-slim n'embarque aucune police. curl sert au healthcheck.
+# - fonts-dejavu (core+extra) : familles sans/bold/mono/serif/condensed pour la réécriture d'images (OCR) ; python:3.11-slim
+#   n'embarque aucune police.
+# - tesseract fra+deu+eng (+ osd) : OCR des images, des pages scannées et du 2e filet.
+# - libreoffice-writer (sans GUI, --no-install-recommends) : RTF <-> DOCX (sanitize_rtf). Java et les autres modules
+#   (calc, impress, GTK) ne sont pas installés. Mesure de l'image : voir README (taille avant/après).
+# - curl : healthcheck.
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      tesseract-ocr tesseract-ocr-fra tesseract-ocr-deu fonts-dejavu curl \
-    && rm -rf /var/lib/apt/lists/*
+      tesseract-ocr tesseract-ocr-fra tesseract-ocr-deu tesseract-ocr-eng \
+      fonts-dejavu curl \
+      libreoffice-writer libreoffice-core libreoffice-common \
+    && rm -rf /var/lib/apt/lists/* /usr/share/doc /usr/share/man
 
 WORKDIR /app
 COPY requirements.txt .
@@ -17,6 +23,8 @@ COPY seed/ /app/seed/
 
 RUN useradd -u 10001 -m masquerading
 USER 10001
+# LibreOffice écrit un profil utilisateur : chaque conversion utilise -env:UserInstallation=file:///tmp/lo_<pid>_…
+ENV SOFFICE=/usr/bin/soffice HOME=/home/masquerading
 
 EXPOSE 8080
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
