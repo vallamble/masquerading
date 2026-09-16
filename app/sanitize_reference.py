@@ -26,6 +26,7 @@ service), formatage du paragraphe DOCX ramené au style du premier run quand une
 coupées sur deux lignes dans les images non traitées.
 """
 import argparse
+import collections
 import csv
 import hashlib
 import hmac
@@ -588,6 +589,97 @@ def sanitize_docx(src, dst, pz, strict):
             zout.writestr(item, data)
     os.unlink(tmp)
     return {"text_replacements": log, "images": img_log}
+# ---------------------------------------------------------------------------
+# RTF : conversion LibreOffice (RTF -> DOCX -> sanitize_docx -> RTF). Variante « native » (parser les mots de
+# contrôle RTF et patcher les runs en place) = cible production, non codée ici (voir RAPPORT gap customer).
+# ---------------------------------------------------------------------------
+_SOFFICE_CANDIDATES = [os.environ.get("SOFFICE", ""), "/usr/bin/soffice", "/usr/lib/libreoffice/program/soffice",
+                       os.path.expanduser("~/Applications/LibreOffice.app/Contents/MacOS/soffice"),
+                       "/Applications/LibreOffice.app/Contents/MacOS/soffice"]
+
+
+def soffice_bin():
+    for c in _SOFFICE_CANDIDATES:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+def soffice_convert(src, fmt, outdir, timeout=120):
+    """`soffice --headless --convert-to <fmt>` avec un profil utilisateur ISOLÉ par appel (-env:UserInstallation) :
+    deux requêtes simultanées ne se disputent pas le verrou du profil par défaut."""
+    exe = soffice_bin()
+    if not exe:
+        raise RuntimeError("LibreOffice (soffice) introuvable : nécessaire pour le RTF (conteneur : libreoffice-writer)")
+    prof = tempfile.mkdtemp(prefix="lo_%d_" % os.getpid())
+    cmd = [exe, "--headless", "--norestore", "--nologo", "-env:UserInstallation=file://%s" % prof,
+           "--convert-to", fmt, "--outdir", outdir, src]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    finally:
+        shutil.rmtree(prof, ignore_errors=True)
+    out = os.path.join(outdir, os.path.splitext(os.path.basename(src))[0] + "." + fmt)
+    if not os.path.exists(out):
+        raise RuntimeError("conversion LibreOffice %s -> %s échouée : %s %s" % (os.path.basename(src), fmt, r.stdout.strip(), r.stderr.strip()))
+    return out
+
+
+def _docx_text_parts(path):
+    """Texte d'un DOCX par zone : body (paragraphes + tableaux), header, footer — pour le contrôle de fidélité RTF."""
+    from docx import Document
+    d = Document(path)
+    body = [p.text for p in d.paragraphs] + [c.text for t in d.tables for r in t.rows for c in r.cells]
+    header = [p.text for s_ in d.sections for p in s_.header.paragraphs]
+    footer = [p.text for s_ in d.sections for p in s_.footer.paragraphs]
+    return {"body": "\n".join(body), "header": "\n".join(header), "footer": "\n".join(footer),
+            "tables": len(d.tables), "paragraphs": len(d.paragraphs)}
+
+
+def sanitize_rtf(src, dst, pz, strict):
+    """RTF -> DOCX (LibreOffice) -> sanitize_docx -> RTF (LibreOffice). Puis contrôle : tout le texte NON sensible du RTF
+    de sortie doit être identique à l'entrée (diff des jetons hors valeurs remplacées) ; en-tête, pied de page et tableaux
+    doivent survivre à l'aller-retour. Un écart est journalisé (RTF_FIDELITY_WARN) et marque le fichier pour revue."""
+    tmp = tempfile.mkdtemp(prefix="rtf_")
+    try:
+        docx_in = soffice_convert(src, "docx", tmp)
+        work = os.path.join(tmp, "work"); os.makedirs(work)
+        docx_out = os.path.join(work, os.path.basename(docx_in))
+        res = sanitize_docx(docx_in, docx_out, pz, strict)
+        rtf_out = soffice_convert(docx_out, "rtf", work)
+        shutil.move(rtf_out, dst)
+        # contrôle de fidélité sur le RTF réellement écrit (re-lu via DOCX)
+        back = soffice_convert(dst, "docx", os.path.join(tmp, "back"))
+        a, b = _docx_text_parts(docx_in), _docx_text_parts(back)
+        originals = {e["original"] for e in res.get("text_replacements", [])}
+        replacements = {e["replacement"] for e in res.get("text_replacements", [])}
+
+        def tokens(txt, drop):
+            for v in sorted(drop, key=len, reverse=True):
+                txt = txt.replace(v, " ")
+            return collections.Counter(re.findall(r"\w+", txt))
+        fid = {}
+        for zone in ("body", "header", "footer"):
+            ta, tb = tokens(a[zone], originals), tokens(b[zone], replacements)
+            fid[zone] = {"missing": sorted((ta - tb).elements())[:20], "added": sorted((tb - ta).elements())[:20],
+                         "tokens_in": sum(ta.values()), "tokens_out": sum(tb.values())}
+        fid["tables_in"], fid["tables_out"] = a["tables"], b["tables"]
+        fid["header_present"] = bool(b["header"].strip()) if a["header"].strip() else True
+        fid["footer_present"] = bool(b["footer"].strip()) if a["footer"].strip() else True
+        problems = [z for z in ("body", "header", "footer") if fid[z]["missing"] or fid[z]["added"]]
+        if a["tables"] != b["tables"]:
+            problems.append("tables")
+        if not fid["header_present"]:
+            problems.append("header_lost")
+        if not fid["footer_present"]:
+            problems.append("footer_lost")
+        fid["ok"] = not problems
+        res["rtf"] = {"via": "libreoffice", "fidelity": fid}
+        if problems:
+            res.setdefault("review", []).append({"type": "RTF_FIDELITY_WARN", "zones": problems,
+                                                 "hint": "LibreOffice a modifié du texte non sensible ou perdu une zone : vérifier le RTF"})
+        return res
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def sanitize_xlsx(src, dst, pz, strict):
@@ -765,6 +857,8 @@ def main():
             try:
                 if ext == ".docx":
                     res = sanitize_docx(src, dst, pz, a.strict)
+                elif ext == ".rtf":
+                    res = sanitize_rtf(src, dst, pz, a.strict)
                 elif ext == ".xlsx":
                     res = sanitize_xlsx(src, dst, pz, a.strict)
                 elif ext == ".pdf":
