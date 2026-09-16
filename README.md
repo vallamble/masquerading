@@ -37,6 +37,11 @@ schema). POST requests require the `X-Api-Key: $SERVICE_API_KEY` header.
 | `SCAN_DPI` | render resolution for scanned PDF pages (OCR + second pass) | `300` |
 | `SOFFICE` | path to LibreOffice `soffice` (RTF conversion) | auto-detected |
 
+Every secret variable also accepts the Docker convention `<VAR>_FILE` (path to a file holding the value), and falls back
+to `/run/secrets/<VAR>` if present: `deploy/docker-compose.yml` mounts the four Swarm secrets `SERVICE_API_KEY`,
+`GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET` (created in Portainer → Secrets) that way, so no secret value
+ever lives in the compose file or in the stack's environment variables.
+
 Persistent state: `${DATA_DIR}/mapping_by_value.csv` (pseudonym table; seed copied on first
 start if missing) and `${DATA_DIR}/generated.json` (unknown values, deterministic derivation).
 The service starts **without** Graph credentials (returns 202 and logs); the Graph call only
