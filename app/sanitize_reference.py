@@ -514,6 +514,152 @@ def sanitize_image_bytes(data, ext, pz: Pseudonymizer, strict=False, ocr_scale=N
     return buf.getvalue(), log
 
 
+SIGNATURE_WORDS = {"signature", "signatures", "signé", "signe", "signed", "unterschrift", "visa", "firma", "sign", "signature:"}
+SIG_NEAR_PX = 250          # distance max (px) entre un libellé « Signature » et la zone d'encre (à droite ou en dessous)
+
+
+def _ink_mask(img):
+    """Masque d'encre : pixel nettement différent du fond ET sombre (noir, bleu foncé) ; fond = médiane de l'image."""
+    import numpy as np
+    a = np.asarray(img).astype(int)
+    page_bg = np.median(a.reshape(-1, 3), axis=0)
+    diff = np.abs(a - page_bg).sum(axis=2)
+    return (diff > 150) & (a.min(axis=2) < 100), page_bg
+
+
+def _components(mask, step=2):
+    """Composantes connexes (4-voisinage) sur une image réduite d'un facteur `step` : [(x0, y0, x1, y1, n_pixels)]."""
+    import numpy as np
+    small = mask[::step, ::step]
+    sh, sw = small.shape
+    labels = np.zeros((sh, sw), dtype=np.int32)
+    boxes, cur = [], 0
+    ys, xs = np.nonzero(small)
+    for y, x in zip(ys, xs):
+        if labels[y, x]:
+            continue
+        cur += 1
+        stack = [(y, x)]; labels[y, x] = cur
+        bx0 = bx1 = x; by0 = by1 = y; n = 0
+        while stack:
+            cy, cx = stack.pop(); n += 1
+            bx0, bx1, by0, by1 = min(bx0, cx), max(bx1, cx), min(by0, cy), max(by1, cy)
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < sh and 0 <= nx < sw and small[ny, nx] and not labels[ny, nx]:
+                    labels[ny, nx] = cur; stack.append((ny, nx))
+        boxes.append((bx0 * step, by0 * step, (bx1 + 1) * step, (by1 + 1) * step, n * step * step))
+    return boxes
+
+
+def _trusted_words(words):
+    """Mots OCR dont la boîte peut être retirée du masque d'encre : lus de façon STABLE par ≥ 2 passes (même texte
+    normalisé, boîtes qui se recouvrent) ou avec une confiance ≥ 75. Un paraphe lu comme « DWDM » (conf. 41) dans une
+    seule passe n'est pas un mot : sa boîte ne doit pas effacer l'encre de la signature."""
+    cands = [w for w in words if w["conf"] >= 30 and len(w["text"]) >= 2]
+    out = []
+    for i, a in enumerate(cands):
+        if a["conf"] >= 75:
+            out.append(a); continue
+        ta = norm(a["text"]).casefold()
+        for j, b in enumerate(cands):
+            if i == j or a["line"][:2] == b["line"][:2]:
+                continue                                        # même passe (échelle, psm)
+            ix = max(0, min(a["x"] + a["w"], b["x"] + b["w"]) - max(a["x"], b["x"]))
+            iy = max(0, min(a["y"] + a["h"], b["y"] + b["h"]) - max(a["y"], b["y"]))
+            if ix * iy > 0.5 * a["w"] * a["h"] and _levenshtein(ta, norm(b["text"]).casefold(), 2) <= 1:
+                out.append(a); break
+    return out
+
+
+def _signature_label_boxes(words):
+    out = []
+    for w in words:
+        t = w["text"].strip().casefold().strip(".,;:()")
+        if t in SIGNATURE_WORDS or t.rstrip(":") in SIGNATURE_WORDS:
+            out.append((w["x"], w["y"], w["x"] + w["w"], w["y"] + w["h"]))
+    return out
+
+
+def _near_label(box, labels, dist=SIG_NEAR_PX):
+    x0, y0, x1, y1 = box
+    for lx0, ly0, lx1, ly1 in labels:
+        right = 0 <= x0 - lx1 <= dist and y0 <= ly1 + dist and y1 >= ly0 - dist        # à droite du libellé
+        below = 0 <= y0 - ly1 <= dist and x0 <= lx1 + dist and x1 >= lx0 - dist        # en dessous
+        if right or below:
+            return True
+    return False
+
+
+def _cover_signatures(img, words, done_boxes, apply=True, force_location=False):
+    """Détecteur de ZONE DE SIGNATURE (image ou rendu de page) et recouvrement ciblé.
+    Candidats : composantes connexes d'encre sombre qu'aucune boîte de mot OCR ne couvre, regroupées par proximité.
+    Filtres : (1) localisation — tiers bas de l'image OU ≤ 250 px à droite/en dessous d'un libellé « Signature/Signé/
+    Signed/Unterschrift/Visa/Firma » (force_location : l'image est elle-même placée dans une zone de signature) ;
+    (2) forme — largeur/hauteur entre 1,5 et 10, taux de remplissage 3–35 % ; (3) taille ≥ 40×12 px.
+    Rejets explicites : encre à > 90 % sur le périmètre de la boîte (cadres), hauteur < 6 px (lignes, filets).
+    Action : rectangle couleur de fond locale (+4 px), log SIGNATURE_COVERED. Sans apply : SIGNATURE_DETECTED."""
+    import numpy as np
+    from PIL import ImageDraw
+    ink, page_bg = _ink_mask(img)
+    h, w = ink.shape
+    for wd in _trusted_words(words):
+        x0, y0, x1, y1 = wd["x"] - 3, wd["y"] - 3, wd["x"] + wd["w"] + 3, wd["y"] + wd["h"] + 3
+        ink[max(0, y0):min(h, y1), max(0, x0):min(w, x1)] = False
+    for x0, y0, x1, y1 in done_boxes:
+        ink[max(0, y0 - 4):min(h, y1 + 4), max(0, x0 - 4):min(w, x1 + 4)] = False
+    comps = [list(c[:4]) for c in _components(ink) if c[3] - c[1] >= 3 and c[2] - c[0] >= 3]
+    # regroupement par proximité (traits d'un même paraphe, soulignement) ; on garde les composantes de chaque groupe
+    comps.sort(key=lambda b: (b[1], b[0]))
+    merged, members = [], []
+    for c in comps:
+        for i, m in enumerate(merged):
+            if c[0] <= m[2] + 30 and c[2] >= m[0] - 30 and c[1] <= m[3] + 20 and c[3] >= m[1] - 20:
+                m[0], m[1], m[2], m[3] = min(m[0], c[0]), min(m[1], c[1]), max(m[2], c[2]), max(m[3], c[3]); members[i].append(c); break
+        else:
+            merged.append(list(c)); members.append([c])
+    labels = _signature_label_boxes(words)
+    log, zones = [], []
+    for (x0, y0, x1, y1), parts in zip(merged, members):
+        bw, bh = x1 - x0, y1 - y0
+        why = None
+        if bh < 6:
+            why = "line"
+        elif bw < 40 or bh < 12:
+            why = "too_small"
+        elif not (1.5 <= bw / bh <= 10):
+            why = "aspect"
+        elif not any((c[2] - c[0]) >= 0.5 * bw and (c[3] - c[1]) >= max(12, 0.3 * bh) for c in parts):
+            why = "no_continuous_stroke"      # texte imprimé non lu : lettres séparées ; un paraphe est un trait continu
+        else:
+            sub = ink[y0:y1, x0:x1]
+            total = int(sub.sum())
+            fill = total / max(1, bw * bh)
+            band = 3
+            perim = int(sub[:band].sum() + sub[-band:].sum() + sub[band:-band, :band].sum() + sub[band:-band, -band:].sum())
+            if total and perim / total > 0.9:
+                why = "frame"
+            elif not (0.03 <= fill <= 0.35):
+                why = "fill=%.2f" % fill
+            elif not (force_location or (y0 + y1) / 2 >= 2 * h / 3 or _near_label((x0, y0, x1, y1), labels)):
+                why = "location"
+        if why:
+            if bw >= 40 and bh >= 12 and why not in ("line", "too_small"):
+                log.append({"type": "SIGNATURE", "match": "rejected", "reason": why, "box": [int(x0), int(y0), int(x1), int(y1)]})
+            continue
+        zones.append((x0, y0, x1, y1))
+    draw = ImageDraw.Draw(img)
+    for x0, y0, x1, y1 in zones:
+        pad = 4
+        bx0, by0, bx1, by1 = max(0, x0 - pad), max(0, y0 - pad), min(w - 1, x1 + pad), min(h - 1, y1 + pad)
+        border = [img.getpixel((x, y)) for x in range(bx0, bx1, 4) for y in (by0, by1)]
+        bg = tuple(sorted(c[i] for c in border)[len(border) // 2] for i in range(3)) if border else tuple(int(v) for v in page_bg)
+        if apply:
+            draw.rectangle([bx0, by0, bx1, by1], fill=bg)
+        log.append({"type": "SIGNATURE_COVERED" if apply else "SIGNATURE_DETECTED", "match": "covered" if apply else "detected",
+                    "box": [int(bx0), int(by0), int(bx1), int(by1)], "original": None, "replacement": None})
+    return log
+
+
 def _cover_unread_ink(img, words, done_boxes, apply=False):
     """Fail-closed : zones d'encre que l'OCR n'a lues dans aucune passe (signature, écriture illisible) → recouvertes.
     Ce que personne ne peut lire ne peut pas être vérifié ; on préfère l'effacer que le laisser passer.
@@ -1323,13 +1469,32 @@ def sanitize_pdf(src, dst, pz, strict):
                 while fs > 4 and page.insert_textbox(box, rr, fontsize=fs, fontname="helv", color=(0, 0, 0)) < 0:
                     fs -= 0.5
                 log.append({"page": page.number + 1, "type": dtype, "original": v, "replacement": rr})
+        # signatures vectorielles (tracés courbes), annotations /Ink, champs /Sig -> recouvrement (COVER_SIGNATURES)
+        if os.environ.get("COVER_SIGNATURES", "1") == "1":
+            try:
+                sl = _cover_vector_signatures(page, fitz)
+                if sl:
+                    img_log.append({"page": page.number + 1, "xref": None, "vector": True, "replacements": sl})
+            except Exception as exc:  # noqa
+                img_log.append({"page": page.number + 1, "xref": None, "vector": True,
+                                "replacements": [{"type": "SIGNATURE", "match": "vector_detect_failed", "error": str(exc)}]})
+        sig_labels = _pdf_signature_labels(page)
         for img in page.get_images(full=True):
             xref = img[0]
             info = doc.extract_image(xref)
-            data, l = sanitize_image_bytes(info["image"], "." + info["ext"], pz, strict)
+            # une image placée dans une zone de signature (tiers bas, ou près d'un libellé) est peut-être LE paraphe
+            ctx = False
+            try:
+                for r in page.get_image_rects(xref):
+                    if _rect_in_signature_zone(page, r, sig_labels):
+                        ctx = True
+            except Exception:
+                pass
+            data, l = sanitize_image_bytes(info["image"], "." + info["ext"], pz, strict, signature_context=ctx)
             if l:
                 page.replace_image(xref, stream=data)
-                img_log.append({"page": page.number + 1, "xref": xref, "replacements": l})
+                img_log.append({"page": page.number + 1, "xref": xref, "signature_context": ctx, "replacements": l})
+        pages_log.append({"page": page.number + 1, "scanned": False, "masked": len([r for r in rects if r[3]])})
     # garbage=4 + clean : supprime les objets devenus orphelins après replace_image (l'ancienne image comptait
     # encore dans le PDF de sortie — anomalie « 8 images au lieu de 4 »). À recouper avec `pdfimages -list`.
     # pièces jointes (embedded files) : extraites, routées par extension, réécrites (embfile_upd) ; inconnues -> revue
