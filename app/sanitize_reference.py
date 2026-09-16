@@ -152,8 +152,15 @@ class Pseudonymizer:
                     continue
                 if dtype == "AHV_NUMBER" and not ahv_is_valid(v):
                     continue
-                if dtype == "CREDIT_CARD" and not luhn_is_valid(v):
-                    continue
+                if dtype == "CREDIT_CARD":
+                    if not luhn_is_valid(v):
+                        continue
+                    # Un corps d'IBAN n'est pas un numéro de carte : 16 chiffres consécutifs pris dans un IBAN
+                    # passent Luhn par hasard (~1 fois sur 10). Sans ce garde-fou, le sanitizer remplaçait deux
+                    # leurres « IBAN à checksum invalide » de la page 179 par des numéros de carte de test.
+                    before = text[max(0, m.start() - 8):m.start()]
+                    if re.search(r"[A-Z]{2}\d{2}\s?$", before) or re.search(r"\d\s?$", before):
+                        continue
                 known = self.map.get(norm(v).casefold())
                 rep = known[1] if known else self.generate(dtype, v)
                 if known and " " not in v and " " in rep:
@@ -614,6 +621,56 @@ def sanitize_xlsx(src, dst, pz, strict):
     return {"text_replacements": log}
 
 
+def _pdf_line_matches(page, pz, strict, fitz):
+    """Détection par LIGNE reconstruite depuis les boîtes de mots (même principe que la branche image).
+
+    `page.search_for(valeur)` échoue quand l'espace de la valeur n'est pas un vrai caractère espace dans le flux
+    PDF (espacement par positionnement : « +41 21 000 35 16 », « 8400 Winterthur ») ou quand la valeur est coupée
+    par un retour à la ligne : la valeur reste alors en clair. On reconstruit donc le texte ligne par ligne avec
+    l'offset de chaque mot, on détecte sur ce texte, et on remonte aux rectangles des mots recouverts.
+    Retourne [(rects, dtype, original, remplacement)] — plusieurs rects quand la valeur court sur deux lignes.
+    """
+    words = page.get_text("words")          # (x0, y0, x1, y1, mot, bloc, ligne, n° mot)
+    lines = {}
+    for w in words:
+        lines.setdefault((w[5], w[6]), []).append(w)
+    seq = []
+    for key in sorted(lines):
+        ws = sorted(lines[key], key=lambda w: w[7])
+        offs, pos, parts = [], 0, []
+        for w in ws:
+            offs.append((pos, pos + len(w[4]), w)); parts.append(w[4]); pos += len(w[4]) + 1
+        seq.append((" ".join(parts), offs))
+
+    out, seen = [], set()
+
+    def collect(text, offs):
+        for s, e, dtype, v, rep in pz.detect(text, strict):
+            hit = [w for (a, b, w) in offs if a < e and b > s]
+            if not hit:
+                continue
+            key = (round(hit[0][0], 1), round(hit[0][1], 1), v)
+            if key in seen:
+                continue
+            seen.add(key)
+            # un rectangle par ligne traversée (une valeur coupée par un retour à la ligne en produit deux)
+            by_line = {}
+            for w in hit:
+                by_line.setdefault((w[5], w[6]), []).append(w)
+            rects = [fitz.Rect(min(w[0] for w in g), min(w[1] for w in g),
+                               max(w[2] for w in g), max(w[3] for w in g)) for g in by_line.values()]
+            out.append((rects, dtype, v, rep))
+
+    for text, offs in seq:
+        collect(text, offs)
+    # 2e passe : valeurs coupées entre deux lignes consécutives
+    for (t1, o1), (t2, o2) in zip(seq, seq[1:]):
+        joined = t1 + " " + t2
+        shift = len(t1) + 1
+        collect(joined, list(o1) + [(a + shift, b + shift, w) for (a, b, w) in o2])
+    return out
+
+
 def sanitize_pdf(src, dst, pz, strict):
     try:
         import fitz  # PyMuPDF
@@ -628,6 +685,11 @@ def sanitize_pdf(src, dst, pz, strict):
         for s, e, dtype, v, rep in spans:
             uniq.setdefault(v, (dtype, rep))
         rects = []
+        for rs, dtype, v, rep in _pdf_line_matches(page, pz, strict, fitz):
+            for i, r in enumerate(rs):
+                rects.append((r, v, dtype, rep if i == 0 else ""))   # la suite de la valeur coupée est effacée
+            uniq.pop(v, None)
+        # filet de sécurité : ce que la détection par lignes n'a pas vu (valeur dans une annotation, un champ…)
         for v, (dtype, rep) in uniq.items():
             for r in page.search_for(v):
                 rects.append((r, v, dtype, rep))
@@ -636,6 +698,8 @@ def sanitize_pdf(src, dst, pz, strict):
         if rects:
             page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
             for r, v, dtype, rep in rects:
+                if not rep:
+                    continue        # 2e ligne d'une valeur coupée : la zone est effacée, rien à réécrire
                 rr = rep.upper() if (v.isupper() and dtype in ("FIRST_NAME", "LAST_NAME")) else rep
                 fs = max(5.0, r.height * 0.78)
                 box = fitz.Rect(r.x0, r.y0 - 1, r.x1 + 2, r.y1 + 1)
@@ -649,7 +713,9 @@ def sanitize_pdf(src, dst, pz, strict):
             if l:
                 page.replace_image(xref, stream=data)
                 img_log.append({"page": page.number + 1, "xref": xref, "replacements": l})
-    doc.save(dst, garbage=3, deflate=True)
+    # garbage=4 + clean : supprime les objets devenus orphelins après replace_image (l'ancienne image comptait
+    # encore dans le PDF de sortie — anomalie « 8 images au lieu de 4 »). À recouper avec `pdfimages -list`.
+    doc.save(dst, garbage=4, clean=True, deflate=True)
     return {"text_replacements": log, "images": img_log}
 
 
