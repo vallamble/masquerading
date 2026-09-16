@@ -201,7 +201,7 @@ def _load_mapping():
             with open(GENERATED, encoding="utf-8") as f:
                 for k, v in json.load(f).items():
                     if k not in seen:
-                        rows.append(("(généré)", k, v, "runtime"))
+                        rows.append(("generated (HMAC)", k, v, "runtime"))
         except Exception:
             pass
     return rows
@@ -221,8 +221,8 @@ def mapping(format: str = "html"):
         f"<td class='p'>{html.escape(p)}</td><td class='s'>{html.escape(s)}</td></tr>"
         for dt, o, p, s in rows
     )
-    page = f"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
-<title>Masquerading — table de correspondance</title>
+    page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<title>Masquerading — mapping table</title>
 <style>
  body{{font:14px/1.4 system-ui,sans-serif;margin:2rem;color:#1a1a2e}}
  h1{{font-size:1.2rem}} .n{{color:#667;margin-bottom:1rem}}
@@ -231,10 +231,10 @@ def mapping(format: str = "html"):
  th{{position:sticky;top:0;background:#f5f6ff}} td.p{{color:#0a7d34;font-weight:600}} td.s{{color:#889;font-size:.85em}}
  tr:hover{{background:#fafbff}}
 </style></head><body>
-<h1>Masquerading — table de correspondance (masquage signifiant)</h1>
-<div class="n">{len(rows)} entrées · données 100 % fictives (lab) · original → pseudonyme cohérent</div>
-<input id="q" placeholder="filtrer… (nom, IBAN, type)" oninput="f()">
-<table><thead><tr><th>Type</th><th>Valeur d'origine</th><th>Pseudonyme</th><th>Source</th></tr></thead>
+<h1>Masquerading — mapping table (meaningful masking)</h1>
+<div class="n">{len(rows)} entries · 100% synthetic data (lab) · original → consistent pseudonym</div>
+<input id="q" placeholder="Filter… (name, IBAN, type)" oninput="f()">
+<table><thead><tr><th>Type</th><th>Original value</th><th>Pseudonym</th><th>Source</th></tr></thead>
 <tbody id="t">{body}</tbody></table>
 <script>
  function f(){{var v=document.getElementById('q').value.toLowerCase();
