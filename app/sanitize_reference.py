@@ -1335,9 +1335,25 @@ def _cover_vector_signatures(page, fitz):
             bg = (1, 1, 1)
         page.add_redact_annot(box, fill=bg)
         log.append({"type": "SIGNATURE_COVERED", "match": "covered_" + kind, "box": [round(v, 1) for v in box], "original": None, "replacement": None})
-    # la redaction retire les tracés entièrement couverts et peint le fond ; les cadres/filets qui ne font que
-    # traverser la boîte ne sont pas retirés (REMOVE_IF_COVERED, pas IF_TOUCHED)
-    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED)
+    # Retrait EFFECTIF des tracés : avec REMOVE_IF_COVERED, PyMuPDF laissait 7 tracés sur 8 dans le flux (recouverts
+    # d'un rectangle blanc = récupérables en retirant le rectangle, pas fail-closed). REMOVE_IF_TOUCHED les retire
+    # tous ; un cadre/filet qui traverserait la boîte serait retiré aussi (journalisé ci-dessous, priorité au PII).
+    boxes = [fitz.Rect(r.x0 - 4, r.y0 - 4, r.x1 + 4, r.y1 + 4) & page.rect for _, r in zones]
+    before = [(fitz.Rect(d["rect"]), tuple(it[0] for it in d.get("items", []))) for d in page.get_drawings()]
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED)
+    after = [(fitz.Rect(d["rect"]), tuple(it[0] for it in d.get("items", []))) for d in page.get_drawings()]
+    # post-contrôle : plus aucun tracé courbe dans les boîtes (sinon LEAK_SUSPECT_VECTOR) ; tracés non courbes retirés = effet de bord
+    for b in boxes:
+        residual = [r for r, kinds in after if "c" in kinds and r.intersects(b)]
+        if residual:
+            log.append({"type": "LEAK_SUSPECT_VECTOR", "match": "curves_remaining", "box": [round(v, 1) for v in b], "count": len(residual),
+                        "hint": "tracés vectoriels encore présents sous le recouvrement : revue manuelle"})
+    removed_non_curve = [r for r, kinds in before if "c" not in kinds and any(r.intersects(b) for b in boxes)
+                         and not any(r == r2 and kinds == k2 for r2, k2 in after)]
+    if removed_non_curve:
+        log.append({"type": "SIGNATURE_COVER_SIDE_EFFECT", "match": "non_curve_paths_removed", "count": len(removed_non_curve),
+                    "boxes": [[round(v, 1) for v in r] for r in removed_non_curve[:5]],
+                    "hint": "un cadre/filet touchant la zone de signature a été retiré avec elle"})
     return log
 
 
