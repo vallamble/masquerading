@@ -8,13 +8,20 @@ services:
     image: ghcr.io/vallamble/masquerading:latest
     volumes:
       - masquerading_data:/data
+    # Secrets Swarm existants (Portainer → Secrets), montés dans /run/secrets/<nom> ; l'application lit
+    # <VAR>_FILE (convention Docker). Aucune valeur secrète dans ce fichier ni dans les variables de la stack.
+    secrets:
+      - SERVICE_API_KEY
+      - GRAPH_TENANT_ID
+      - GRAPH_CLIENT_ID
+      - GRAPH_CLIENT_SECRET
     environment:
       # --- Auth du service (header X-Api-Key attendu des workflows Securiti) ---
-      SERVICE_API_KEY: "${SERVICE_API_KEY}"
+      SERVICE_API_KEY_FILE: /run/secrets/SERVICE_API_KEY
       # --- Microsoft Graph app-only (app Entra Sites.Selected sur le site racine) ---
-      GRAPH_TENANT_ID: "${GRAPH_TENANT_ID}"
-      GRAPH_CLIENT_ID: "${GRAPH_CLIENT_ID}"
-      GRAPH_CLIENT_SECRET: "${GRAPH_CLIENT_SECRET}"
+      GRAPH_TENANT_ID_FILE: /run/secrets/GRAPH_TENANT_ID
+      GRAPH_CLIENT_ID_FILE: /run/secrets/GRAPH_CLIENT_ID
+      GRAPH_CLIENT_SECRET_FILE: /run/secrets/GRAPH_CLIENT_SECRET
       # --- Cible SharePoint (site racine du tenant → SP_SITE_PATH vide) ---
       SP_HOSTNAME: "m365x42057173.sharepoint.com"
       SP_SITE_PATH: ""
@@ -44,6 +51,16 @@ services:
         - "traefik.http.routers.masquerading.tls.certresolver=le"
         # En mode Swarm, le port cible du conteneur est obligatoire en label.
         - "traefik.http.services.masquerading.loadbalancer.server.port=8080"
+
+secrets:
+  SERVICE_API_KEY:
+    external: true
+  GRAPH_TENANT_ID:
+    external: true
+  GRAPH_CLIENT_ID:
+    external: true
+  GRAPH_CLIENT_SECRET:
+    external: true
 
 volumes:
   masquerading_data:

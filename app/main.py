@@ -32,7 +32,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 import sanitize_reference as sr
-from graph import GraphClient
+from graph import GraphClient, secret
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("masquerading")
@@ -43,7 +43,7 @@ GENERATED = os.path.join(DATA_DIR, "generated.json")
 SEED_MAPPING = os.environ.get("SEED_MAPPING", "/app/seed/mapping_by_value.csv")
 INBOUND = os.environ.get("INBOUND_PREFIX", "Inbound")
 OUTPUT = os.environ.get("OUTPUT_PREFIX", "Output")
-API_KEY = os.environ.get("SERVICE_API_KEY", "")
+API_KEY = secret("SERVICE_API_KEY", default="")   # env, SERVICE_API_KEY_FILE ou /run/secrets/SERVICE_API_KEY
 
 app = FastAPI(title="masquerading", version="0.1.0")
 jobs: "queue.Queue[dict]" = queue.Queue()

@@ -13,14 +13,30 @@ GRAPH = "https://graph.microsoft.com/v1.0"
 UPLOAD_CHUNK = 5 * 1024 * 1024  # multiple de 320 KiB requis par Graph ; 5 MiB
 
 
+def secret(name, default=None, required=False):
+    """Valeur de $NAME, ou contenu du fichier $NAME_FILE (secrets Docker Swarm montés dans /run/secrets/<nom>),
+    ou /run/secrets/<NAME> s'il existe. Espaces et fin de ligne retirés."""
+    v = os.environ.get(name)
+    if not v:
+        path = os.environ.get(name + "_FILE") or (f"/run/secrets/{name}" if os.path.exists(f"/run/secrets/{name}") else None)
+        if path and os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                v = f.read().strip()
+    if not v:
+        if required:
+            raise KeyError(f"{name} : ni variable d'environnement, ni {name}_FILE, ni /run/secrets/{name}")
+        return default
+    return v.strip()
+
+
 class GraphClient:
     def __init__(self):
-        self.tenant = os.environ["GRAPH_TENANT_ID"]
-        self.client_id = os.environ["GRAPH_CLIENT_ID"]
-        self.client_secret = os.environ["GRAPH_CLIENT_SECRET"]
+        self.tenant = secret("GRAPH_TENANT_ID", required=True)
+        self.client_id = secret("GRAPH_CLIENT_ID", required=True)
+        self.client_secret = secret("GRAPH_CLIENT_SECRET", required=True)
         # ex. SP_HOSTNAME=cyberdux.sharepoint.com  SP_SITE_PATH=/sites/AliceTeam
-        self.hostname = os.environ["SP_HOSTNAME"]
-        self.site_path = os.environ["SP_SITE_PATH"]
+        self.hostname = secret("SP_HOSTNAME", required=True)
+        self.site_path = secret("SP_SITE_PATH", default="") or ""
         self._token = None
         self._token_exp = 0.0
         self._site_id = None
