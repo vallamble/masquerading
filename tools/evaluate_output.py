@@ -220,15 +220,9 @@ def extract(path, depth=0):
     elif ext == ".docx":
         from docx import Document
         d = Document(path)
-        parts = [p.text for p in d.paragraphs]
-        for i, p in enumerate(d.paragraphs):
-            res["locs"]["paragraph:%d" % i] = p.text
-        for ti, t in enumerate(d.tables):
-            for ri, row in enumerate(t.rows):
-                for ci, c in enumerate(row.cells):
-                    parts.append(c.text)
-                    res["locs"]["table%d!r%d,c%d" % (ti, ri, ci)] = c.text
-        res["text"] = "\n".join(parts)
+        # texte complet = paragraphes + tableaux + en-têtes/pieds de chaque section (une PII « en pied de page seulement »
+        # était invisible pour l'évaluateur avant le 17.09)
+        res["text"], res["locs"], _st = docx_full_text(path)
         n_img = 0
         with zipfile.ZipFile(path) as z:
             for n in z.namelist():
@@ -411,23 +405,57 @@ def main():
             ip, op = os.path.join(a.inbound, r["file"]), os.path.join(a.output, r["file"])
             if not os.path.exists(op):
                 sig_rows.append(dict(r, status="ABSENT")); ok_all = False; continue
+            vec_resid = None
             if r["file"].lower().endswith(".pdf"):
                 i_ink, o_ink = ink_ratio_pdf(ip, int(r["page"]), box), ink_ratio_pdf(op, int(r["page"]), box)
+                # contenu vectoriel/texte/image RÉSIDUEL sous le recouvrement (invisible au rendu mais présent dans le flux) :
+                # un tracé courbe ou une image non blanche dans la boîte de signature = forme du paraphe récupérable
+                if r["kind"].startswith("signature"):
+                    import fitz
+                    pg = fitz.open(op)[int(r["page"]) - 1]; bx = fitz.Rect(*box)
+                    curves = sum(1 for dr in pg.get_drawings() if any(it[0] == "c" for it in dr["items"]) and fitz.Rect(dr["rect"]).intersects(bx))
+                    imgs = 0
+                    for im in pg.get_images(full=True):
+                        for ir in pg.get_image_rects(im[0]):
+                            if ir.intersects(bx):
+                                pix = fitz.Pixmap(pg.parent, im[0])
+                                if pix.n - pix.alpha >= 1 and pix.samples and (min(pix.samples) < 200):
+                                    imgs += 1
+                    vec_resid = {"curves": curves, "dark_images": imgs}
             else:
                 i_ink, o_ink = ink_ratio_img(ip, box), ink_ratio_img(op, box)
             resid = o_ink / i_ink if i_ink else 0.0
             if r["kind"].startswith("signature"):
-                ok = resid < 0.02
+                ok = resid < 0.02 and (vec_resid is None or (vec_resid["curves"] == 0 and vec_resid["dark_images"] == 0))
             else:
                 ok = abs(o_ink - i_ink) <= 0.05 * max(i_ink, 1e-9)
             ok_all = ok_all and ok
-            sig_rows.append(dict(r, ink_in=round(i_ink, 4), ink_out=round(o_ink, 4), residual=round(resid, 4), ok=ok))
+            sig_rows.append(dict(r, ink_in=round(i_ink, 4), ink_out=round(o_ink, 4), residual=round(resid, 4), vector_residual=vec_resid, ok=ok))
         report["signatures"] = {"rows": sig_rows, "summary": {
             "ok": ok_all, "signatures": sum(1 for x in sig_rows if x["kind"].startswith("signature")),
             "signatures_ok": sum(1 for x in sig_rows if x["kind"].startswith("signature") and x.get("ok")),
             "decoys": sum(1 for x in sig_rows if x["kind"].startswith("decoy")),
             "decoys_intact": sum(1 for x in sig_rows if x["kind"].startswith("decoy") and x.get("ok")),
             "residual_max": max([x.get("residual", 0) for x in sig_rows if x["kind"].startswith("signature")] or [0])}}
+    # cohérence multi-surfaces (#3) : pour chaque (document, valeur) présente dans ≥ 2 types d'emplacement, le pseudonyme
+    # attendu doit être présent dans CHAQUE surface (paragraphe, tableau, en-tête/pied, image, imbriqué)
+    coh = {}
+    for doc in docs:
+        out_path = os.path.join(a.output, doc)
+        if not os.path.exists(out_path):
+            continue
+        groups = {}
+        for r in rows:
+            if r["document"] == doc and r["expected_action"] == "PSEUDONYMIZE":
+                groups.setdefault(r["value"], set()).add(r["section"] or r["location_type"])
+        multi = {v: s_ for v, s_ in groups.items() if len(s_) >= 2}
+        if multi:
+            d = report["documents"][doc]
+            miss = [l for l in report["leaks"] if l["document"] == doc and l["value"] in multi]
+            coh[doc] = {"values_multi_surface": len(multi), "surfaces": {v: sorted(s_) for v, s_ in list(multi.items())[:6]},
+                        "leaks_in_multi_surface_values": len(miss), "replacement_rate": d.get("replacement_rate")}
+    if coh:
+        report["coherence"] = coh
     # objets imbriqués : trouvés (par l'évaluateur) vs traités (log du sanitizer, s'il existe)
     emb = {}
     for doc in docs:
@@ -482,9 +510,14 @@ def main():
         for e in d.get("decoys_modified_examples", []):
             md.append("    - leurre modifié (faux positif) : %s" % e)
     if report.get("signatures"):
-        md += ["", "## Signatures (encre résiduelle) et leurres graphiques", "", "| Fichier | Page | Type | Encre entrée | Encre sortie | Résiduel | OK |", "|---|---|---|---|---|---|---|"]
+        md += ["", "## Signatures (encre résiduelle, contenu résiduel sous le recouvrement) et leurres graphiques", "", "| Fichier | Page | Type | Encre entrée | Encre sortie | Résiduel | Résiduel vectoriel/image | OK |", "|---|---|---|---|---|---|---|---|"]
         for x in report["signatures"]["rows"]:
-            md.append("| %s | %s | %s | %s | %s | %s | %s |" % (x["file"], x["page"], x["kind"], x.get("ink_in"), x.get("ink_out"), x.get("residual"), x.get("ok", x.get("status"))))
+            md.append("| %s | %s | %s | %s | %s | %s | %s | %s |" % (x["file"], x["page"], x["kind"], x.get("ink_in"), x.get("ink_out"), x.get("residual"), json.dumps(x.get("vector_residual")), x.get("ok", x.get("status"))))
+    if report.get("coherence"):
+        md += ["", "## Cohérence multi-surfaces (même pseudonyme dans le texte, les tableaux, les en-têtes/pieds, les images)", ""]
+        for doc, c in report["coherence"].items():
+            md.append("- **%s** : %d valeurs présentes sur ≥ 2 surfaces, fuites parmi elles %d, taux de substitution %s ; ex. %s" % (
+                doc, c["values_multi_surface"], c["leaks_in_multi_surface_values"], c["replacement_rate"], json.dumps(c["surfaces"], ensure_ascii=False)[:300]))
     if report.get("embedded"):
         md += ["", "## Objets imbriqués", ""]
         for doc, e in report["embedded"].items():
