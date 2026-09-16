@@ -260,6 +260,8 @@ def _fit_font(draw, ImageFont, path, original, box_w, box_h):
 _OCR_DIGIT_FIX = str.maketrans({"O": "0", "o": "0", "Q": "0", "D": "0", "I": "1", "l": "1", "|": "1", "S": "5", "Z": "2", "B": "8"})
 _NUMERIC_TOKEN = re.compile(r"^[A-Z]{0,2}[0-9OoQDIl|SZB.\-]{2,}$")
 _IBAN_LOOSE = re.compile(r"\b[A-Z]{2}[0-9OoQDIlSZB]{2}(?:[ ]?[A-Z0-9]{2,4}){3,8}\b")
+# forme d'AVS lue avec des espaces parasites ou des groupes coupés (« 756.456 1.4552.33 ») : fail-closed comme l'IBAN
+_AHV_LOOSE = re.compile(r"\b756[.,]\s?(?:\d\s?){4}[.,]\s?(?:\d\s?){4}[.,]\s?\d{2}\b")
 _IBAN_COUNTRIES = {"CH", "LI", "DE", "AT", "FR", "IT", "ES", "PT", "NL", "BE", "LU", "GB", "IE", "DK", "SE", "NO", "FI", "PL", "CZ", "MC"}
 
 
@@ -291,27 +293,10 @@ def _levenshtein(a, b, cap=3):
     return prev[-1]
 
 
-def sanitize_image_bytes(data, ext, pz: Pseudonymizer, strict=False, ocr_scale=None,
-                         cover_unread=os.environ.get("COVER_UNREAD_INK", "0") == "1"):
-    """Retourne (nouveaux octets, log). Recouvre chaque valeur détectée par OCR et écrit le pseudonyme.
-
-    Robustesse OCR : (1) l'OCR tourne sur une image agrandie 2× (Tesseract lit mal les chiffres < 30 px : « CH6O »
-    au lieu de « CH60 ») ; (2) confusions O/0, I/1, S/5… corrigées dans les jetons numériques avant détection ;
-    (3) « fail-closed » : une chaîne à forme d'IBAN dont le checksum reste faux est rapprochée de la table de
-    pseudonymes (distance ≤ 2) ou recouverte par un IBAN généré — jamais laissée en clair.
-    Rendu : la taille de police est ajustée pour que le texte ORIGINAL remplisse sa boîte (homogène sur la ligne) ;
-    la famille (sans / mono / serif / gras / condensé) est celle dont la largeur rendue colle le mieux à l'original.
-    """
-    from PIL import Image, ImageDraw, ImageFont
-    img = Image.open(io.BytesIO(data)).convert("RGB")
-    # Deux échelles : 2x lit mieux les petits chiffres (texte imprimé), 1x lit mieux les écritures irrégulières
-    # (manuscrit simulé) que l'agrandissement lisse. Les boîtes sont ramenées à l'échelle d'origine.
-    if ocr_scale is None:
-        scales = (2, 1) if img.width * img.height <= 3_000_000 else (1,)
-    else:
-        scales = (ocr_scale,)
-    words = []
-    seen = set()
+def _ocr_words(img, scales):
+    """OCR Tesseract (TSV) aux échelles demandées × psm 11 et 6 ; boîtes ramenées à l'échelle d'origine."""
+    from PIL import Image
+    words, seen = [], set()
     for sc in scales:
         ocr_img = img.resize((img.width * sc, img.height * sc), Image.LANCZOS) if sc != 1 else img
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
@@ -327,13 +312,17 @@ def sanitize_image_bytes(data, ext, pz: Pseudonymizer, strict=False, ocr_scale=N
                               "w": -(-int(w["width"]) // sc), "h": -(-int(w["height"]) // sc),
                               "conf": float(w.get("conf", "0") or 0), "text": w["text"].strip()})
         os.unlink(tmp)
+    return words
+
+
+def _collect_candidates(words, pz, strict):
+    """Lignes OCR -> détection (brute, normalisée O/0-I/1, fail-closed IBAN et noms) -> candidats
+    ((x0, y0, x1, y1), dtype, original, remplacement, méthode, confiance_min) triés (exact > normalisé > approché, boîte large d'abord)."""
     lines = {}
     for w in words:
         if w["text"]:
             lines.setdefault(w["line"], []).append(w)
-    draw = ImageDraw.Draw(img)
-    log, done_boxes, candidates = [], [], []
-    fonts = _font_candidates()
+    candidates = []
     iban_keys = [(norm(k).upper(), rep) for k, (t, rep) in pz.exact.items() if t == "IBAN"]
     name_keys = [(k.casefold(), t, rep) for k, (t, rep) in pz.exact.items()
                  if t in ("FIRST_NAME", "LAST_NAME", "STREET_ADDRESS", "POSTAL_CITY") and len(k) >= 5]
@@ -365,8 +354,6 @@ def sanitize_image_bytes(data, ext, pz: Pseudonymizer, strict=False, ocr_scale=N
             body = norm(m.group(0))[4:]
             if m.group(0)[:2] not in _IBAN_COUNTRIES or sum(c.isdigit() for c in body) < 0.6 * len(body):
                 continue
-            # l'OCR coupe parfois le dernier groupe (« … 5296 » + « 6 ») : étendre aux 1–2 jetons suivants si cela
-            # rapproche de la table de pseudonymes
             cands = [(m.start(), m.end())]
             tail = fixed[m.end():]
             for ext in re.finditer(r"[ ]?[A-Z0-9]{1,4}", tail):
@@ -382,6 +369,23 @@ def sanitize_image_bytes(data, ext, pz: Pseudonymizer, strict=False, ocr_scale=N
                     best = (dist, a, b, rep, how)
             _, a, b, rep, how = best
             spans.append((a, b, "IBAN", text[a:b], rep, how)); covered.append((a, b))
+        # fail-closed : forme d'AVS (756.xxxx.xxxx.xx) avec espaces parasites ou checksum faux -> table (d ≤ 2) sinon générée
+        for m in _AHV_LOOSE.finditer(fixed):
+            if any(a < m.end() and b > m.start() for a, b in covered):
+                continue
+            digits = re.sub(r"\D", "", m.group(0))
+            canon = "%s.%s.%s.%s" % (digits[0:3], digits[3:7], digits[7:11], digits[11:13])
+            known = pz.map.get(norm(canon).casefold())
+            if known:
+                rep, how = known[1], "ocr_respaced"
+            else:
+                hits = sorted(((_levenshtein(digits, re.sub(r"\D", "", k)), r_) for k, (t, r_) in pz.exact.items() if t == "AHV_NUMBER"),
+                              key=lambda t: t[0])
+                if hits and hits[0][0] <= 2 and (len(hits) == 1 or hits[1][0] > hits[0][0]):
+                    rep, how = hits[0][1], "fuzzy_mapping(d=%d)" % hits[0][0]
+                else:
+                    rep, how = pz.generate("AHV_NUMBER", canon), "generated_fail_closed"
+            spans.append((m.start(), m.end(), "AHV_NUMBER", text[m.start():m.end()], rep, how)); covered.append((m.start(), m.end()))
         # fail-closed : mot mal lu par l'OCR (« Pjerre-Alain », confiance basse) proche d'un nom de la table
         for i, w in enumerate(ws):
             a, b = offs[i]
@@ -403,11 +407,17 @@ def sanitize_image_bytes(data, ext, pz: Pseudonymizer, strict=False, ocr_scale=N
             x0 = min(ws[i]["x"] for i in idx); y0 = min(ws[i]["y"] for i in idx)
             x1 = max(ws[i]["x"] + ws[i]["w"] for i in idx); y1 = max(ws[i]["y"] + ws[i]["h"] for i in idx)
             candidates.append(((x0, y0, x1, y1), dtype, v, rep, how, min(ws[i]["conf"] for i in idx)))
-
-    # Ordre de traitement : correspondances exactes d'abord, puis normalisées, puis approchées ; à qualité égale la
-    # boîte la plus large (ex. l'IBAN complet lu par psm 6 gagne sur la version tronquée lue par psm 11).
     rank = {"exact": 0, "ocr_normalized": 1}
     candidates.sort(key=lambda c: (rank.get(c[4], 2), -(c[0][2] - c[0][0])))
+    return candidates
+
+
+def _paint_candidates(img, candidates, fonts, extra_tag=None):
+    """Recouvre chaque candidat (couleur de fond locale) et écrit le pseudonyme (police/taille ajustées à l'original).
+    Retourne (boîtes traitées, log)."""
+    from PIL import ImageDraw, ImageFont
+    draw = ImageDraw.Draw(img)
+    log, done_boxes = [], []
 
     def overlaps(b, d):
         ix = max(0, min(b[2], d[2]) - max(b[0], d[0])); iy = max(0, min(b[3], d[3]) - max(b[1], d[1]))
@@ -418,45 +428,81 @@ def sanitize_image_bytes(data, ext, pz: Pseudonymizer, strict=False, ocr_scale=N
         if any(overlaps(box, d) for d in done_boxes):
             continue   # déjà traité par une autre passe OCR
         done_boxes.append(box)
-        if True:
-            # couleur de fond : médiane d'une bordure autour de la boîte ; couleur d'encre : pixel le plus sombre
-            pad = 3
-            border = [img.getpixel((min(max(x, 0), img.width - 1), min(max(y, 0), img.height - 1)))
-                      for x in range(x0 - pad, x1 + pad, 4) for y in (y0 - pad, y1 + pad)]
-            bg = tuple(sorted(c[i] for c in border)[len(border) // 2] for i in range(3)) if border else (255, 255, 255)
-            inner = [img.getpixel((x, y)) for x in range(x0, x1, 3) for y in range(y0, y1, 2)]
-            ink = min(inner, key=sum) if inner else (15, 15, 15)
-            if sum(bg) - sum(ink) < 90:          # contraste trop faible (fond sombre) : encre par défaut lisible
-                ink = (255, 255, 255) if sum(bg) < 384 else (15, 15, 15)
-            r = rep.upper() if (v.isupper() and dtype in ("FIRST_NAME", "LAST_NAME")) else rep
-            # police : famille dont la largeur rendue de l'ORIGINAL est la plus proche de la boîte, taille = hauteur boîte
-            best = None
-            for fam, path in fonts.items():
-                f, werr, top = _fit_font(draw, ImageFont, path, v, x1 - x0, y1 - y0)
-                if best is None or werr < best[1]:
-                    best = (f, werr, top, fam)
-            font, _, top, fam = best
-            # largeur disponible : la boîte + l'espace libre (couleur de fond) à sa droite, comme le ferait l'application
-            def is_bg(px):
-                return sum(abs(px[i] - bg[i]) for i in range(3)) < 45
-            free = x1 + pad
-            while free < img.width - 1 and free - x1 < (x1 - x0) * 0.8 + 40:
-                if all(is_bg(img.getpixel((free, yy))) for yy in range(y0, y1, max(1, (y1 - y0) // 4))):
-                    free += 2
-                else:
-                    break
-            avail = max(x1 - x0, free - pad - x0)
-            size = font.size
-            while size > 6 and draw.textlength(r, font=font) > avail:
-                size -= 1; font = ImageFont.truetype(font.path, size)
-            xr = x0 + int(draw.textlength(r, font=font)) + pad
-            draw.rectangle([x0 - pad, y0 - pad, max(x1, xr) + pad, y1 + pad], fill=bg)
-            done_boxes[-1] = (x0 - pad, y0 - pad, max(x1, xr) + pad, y1 + pad)
-            draw.text((x0, y0 - top), r, font=font, fill=ink)
-            log.append({"type": dtype, "original": v, "replacement": r, "box": box, "font": fam, "match": how,
-                        "ocr_conf_min": conf_min})
-    # score « encre non lue » (signature, écriture illisible) : toujours calculé pour router l'image en revue manuelle ;
-    # le recouvrement automatique (_cover_unread_ink) est EXPÉRIMENTAL et désactivé par défaut (COVER_UNREAD_INK=1).
+        # couleur de fond : médiane d'une bordure autour de la boîte ; couleur d'encre : pixel le plus sombre
+        pad = 3
+        border = [img.getpixel((min(max(x, 0), img.width - 1), min(max(y, 0), img.height - 1)))
+                  for x in range(x0 - pad, x1 + pad, 4) for y in (y0 - pad, y1 + pad)]
+        bg = tuple(sorted(c[i] for c in border)[len(border) // 2] for i in range(3)) if border else (255, 255, 255)
+        inner = [img.getpixel((x, y)) for x in range(x0, x1, 3) for y in range(y0, y1, 2)]
+        ink = min(inner, key=sum) if inner else (15, 15, 15)
+        if sum(bg) - sum(ink) < 90:          # contraste trop faible (fond sombre) : encre par défaut lisible
+            ink = (255, 255, 255) if sum(bg) < 384 else (15, 15, 15)
+        r = rep.upper() if (v.isupper() and dtype in ("FIRST_NAME", "LAST_NAME")) else rep
+        best = None
+        for fam, path in fonts.items():
+            f, werr, top = _fit_font(draw, ImageFont, path, v, x1 - x0, y1 - y0)
+            if best is None or werr < best[1]:
+                best = (f, werr, top, fam)
+        font, _, top, fam = best
+
+        def is_bg(px):
+            return sum(abs(px[i] - bg[i]) for i in range(3)) < 45
+        free = x1 + pad
+        while free < img.width - 1 and free - x1 < (x1 - x0) * 0.8 + 40:
+            if all(is_bg(img.getpixel((free, yy))) for yy in range(y0, y1, max(1, (y1 - y0) // 4))):
+                free += 2
+            else:
+                break
+        avail = max(x1 - x0, free - pad - x0)
+        size = font.size
+        while size > 6 and draw.textlength(r, font=font) > avail:
+            size -= 1; font = ImageFont.truetype(font.path, size)
+        xr = x0 + int(draw.textlength(r, font=font)) + pad
+        draw.rectangle([x0 - pad, y0 - pad, max(x1, xr) + pad, y1 + pad], fill=bg)
+        done_boxes[-1] = (x0 - pad, y0 - pad, max(x1, xr) + pad, y1 + pad)
+        draw.text((x0, y0 - top), r, font=font, fill=ink)
+        entry = {"type": dtype, "original": v, "replacement": r, "box": box, "font": fam, "match": how, "ocr_conf_min": conf_min}
+        if extra_tag:
+            entry["tag"] = extra_tag
+        log.append(entry)
+    return done_boxes, log
+
+
+def sanitize_image_bytes(data, ext, pz: Pseudonymizer, strict=False, ocr_scale=None,
+                         cover_unread=os.environ.get("COVER_UNREAD_INK", "0") == "1",
+                         cover_signatures=None, signature_context=False):
+    """Retourne (nouveaux octets, log). Recouvre chaque valeur détectée par OCR et écrit le pseudonyme.
+
+    Robustesse OCR : (1) l'OCR tourne sur une image agrandie 2× (Tesseract lit mal les chiffres < 30 px : « CH6O »
+    au lieu de « CH60 ») ; (2) confusions O/0, I/1, S/5… corrigées dans les jetons numériques avant détection ;
+    (3) « fail-closed » : une chaîne à forme d'IBAN dont le checksum reste faux est rapprochée de la table de
+    pseudonymes (distance ≤ 2) ou recouverte par un IBAN généré — jamais laissée en clair.
+    Rendu : la taille de police est ajustée pour que le texte ORIGINAL remplisse sa boîte (homogène sur la ligne) ;
+    la famille (sans / mono / serif / gras / condensé) est celle dont la largeur rendue colle le mieux à l'original.
+    Signatures manuscrites : zones d'encre non lues par l'OCR près d'un libellé « Signature » ou dans le tiers bas
+    → recouvertes par défaut (COVER_SIGNATURES=1), les cadres et filets sont préservés (voir _cover_signatures).
+    """
+    from PIL import Image
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    # Deux échelles : 2x lit mieux les petits chiffres (texte imprimé), 1x lit mieux les écritures irrégulières
+    # (manuscrit simulé) que l'agrandissement lisse. Les boîtes sont ramenées à l'échelle d'origine.
+    if ocr_scale is None:
+        scales = (2, 1) if img.width * img.height <= 3_000_000 else (1,)
+    else:
+        scales = (ocr_scale,)
+    words = _ocr_words(img, scales)
+    candidates = _collect_candidates(words, pz, strict)
+    done_boxes, log = _paint_candidates(img, candidates, _font_candidates())
+    # signatures manuscrites (recouvrement ciblé, activé par défaut) puis score « encre non lue » (revue manuelle) ;
+    # le recouvrement générique de toute encre non lue (_cover_unread_ink, apply=) reste EXPÉRIMENTAL, OFF par défaut.
+    if cover_signatures is None:
+        cover_signatures = os.environ.get("COVER_SIGNATURES", "1") == "1"
+    try:
+        sig = _cover_signatures(img, words, done_boxes, apply=cover_signatures, force_location=signature_context)
+        log += sig
+        done_boxes += [tuple(e["box"]) for e in sig if e.get("match") == "covered"]
+    except Exception as exc:   # noqa : ne jamais bloquer la sanitization
+        log.append({"type": "SIGNATURE", "match": "detect_failed", "error": str(exc)})
     try:
         unread = _cover_unread_ink(img, words, done_boxes, apply=cover_unread)
         log += unread
@@ -763,14 +809,324 @@ def _pdf_line_matches(page, pz, strict, fitz):
     return out
 
 
+
+# ---------------------------------------------------------------------------
+# PDF : pages SCANNÉES (aucun mot dans la couche texte, une image couvre la page)
+# ---------------------------------------------------------------------------
+SCAN_DPI = int(os.environ.get("SCAN_DPI", "300"))
+
+
+def _estimate_skew(gray, max_deg=3.0):
+    """Angle (degrés) tel que gray.rotate(angle) redresse les lignes de texte. Profil de projection : on maximise la
+    variance des sommes de lignes de l'image binarisée (les lignes de texte redressées donnent des pics nets).
+    numpy + PIL seulement (pas d'OpenCV). Grossier au pas de 0,25° puis fin au pas de 0,05°."""
+    import numpy as np
+    from PIL import Image
+    small = gray.resize((max(1, int(gray.width * 1000 / gray.height)), 1000), Image.BILINEAR) if gray.height > 1000 else gray
+    a = np.asarray(small)
+    thr = max(60, min(200, int(np.percentile(a, 30))))          # encre = plus sombre que le fond
+    binimg = Image.fromarray(((a < thr) * 255).astype("uint8"))
+
+    def score(angle):
+        r = np.asarray(binimg.rotate(angle, resample=Image.BILINEAR, fillcolor=0))
+        rows = r.sum(axis=1).astype(float)
+        return rows.var()
+    coarse = np.arange(-max_deg, max_deg + 0.001, 0.25)
+    best = max(coarse, key=score)
+    fine = np.arange(best - 0.25, best + 0.2501, 0.05)
+    best = max(fine, key=score)
+    return float(round(best, 2)) if abs(best) >= 0.1 else 0.0
+
+
+def _prep_scan(render):
+    """Prétraitement OCR d'une page scannée : niveaux de gris + normalisation de contraste (percentiles 1/99)."""
+    import numpy as np
+    from PIL import Image
+    g = np.asarray(render.convert("L")).astype(float)
+    lo, hi = np.percentile(g, 1), np.percentile(g, 99)
+    if hi - lo < 30:
+        return render.convert("L")
+    g = np.clip((g - lo) * 255.0 / (hi - lo), 0, 255)
+    return Image.fromarray(g.astype("uint8"))
+
+
+def _pil_rotate_matrix(w, h, angle):
+    """Matrice affine (a, b, c, d, e, f) utilisée par PIL pour img.rotate(angle) : sortie (x, y) -> entrée."""
+    import math
+    rad = -math.radians(angle % 360)          # PIL : angle = -radians(angle) (rotation anti-horaire à l'écran)
+    a, b, d, e = round(math.cos(rad), 15), round(math.sin(rad), 15), round(-math.sin(rad), 15), round(math.cos(rad), 15)
+    cx, cy = w / 2.0, h / 2.0
+    c = a * (-cx) + b * (-cy) + cx
+    f = d * (-cx) + e * (-cy) + cy
+    return (a, b, c, d, e, f)
+
+
+def _affine_apply(m, x, y):
+    a, b, c, d, e, f = m
+    return a * x + b * y + c, d * x + e * y + f
+
+
+def _affine_from_points(src, dst):
+    """Affine 2×3 qui envoie les 3 points src sur dst (résolution exacte)."""
+    import numpy as np
+    A = np.array([[sx, sy, 1] for sx, sy in src], dtype=float)
+    bx = np.array([d[0] for d in dst], dtype=float); by = np.array([d[1] for d in dst], dtype=float)
+    ax = np.linalg.solve(A, bx); ay = np.linalg.solve(A, by)
+    return (ax[0], ax[1], ax[2], ay[0], ay[1], ay[2])
+
+
+def _affine_invert(m):
+    a, b, c, d, e, f = m
+    det = a * e - b * d
+    ia, ib, id_, ie = e / det, -b / det, -d / det, a / det
+    return (ia, ib, -(ia * c + ib * f), id_, ie, -(id_ * c + ie * f))
+
+
+def _covering_image(page, doc, min_cover=0.8):
+    """Image XObject qui couvre ≥ 80 % de la page : (xref, rect, matrice) ou None (images inline BI/EI, ou rien)."""
+    import fitz
+    best = None
+    for im in page.get_images(full=True):
+        xref = im[0]
+        try:
+            for rect, M in page.get_image_rects(xref, transform=True):
+                cover = (rect & page.mediabox).get_area() / max(1.0, page.mediabox.get_area()) if page.rotation else \
+                        (rect & page.rect).get_area() / max(1.0, page.rect.get_area())
+                if cover >= min_cover and (best is None or cover > best[0]):
+                    best = (cover, xref, rect, M)
+        except Exception:
+            continue
+    return best[1:] if best else None
+
+
+def _transfer_patches(src_img, dst_img, boxes, T):
+    """Copie dans dst_img (image brute) les zones `boxes` de src_img (rendu redressé), via l'affine T (src -> dst) :
+    le rendu réécrit est reprojeté sur la géométrie d'origine (rotation, /Rotate, échelle), sans toucher au reste."""
+    from PIL import Image, ImageDraw
+    Tinv = _affine_invert(T)
+    W, H = dst_img.size
+    for (x0, y0, x1, y1) in boxes:
+        pad = 2
+        corners = [(x0 - pad, y0 - pad), (x1 + pad, y0 - pad), (x1 + pad, y1 + pad), (x0 - pad, y1 + pad)]
+        dc = [_affine_apply(T, x, y) for x, y in corners]
+        bx0, by0 = max(0, int(min(p[0] for p in dc)) - 1), max(0, int(min(p[1] for p in dc)) - 1)
+        bx1, by1 = min(W, int(max(p[0] for p in dc)) + 2), min(H, int(max(p[1] for p in dc)) + 2)
+        if bx1 <= bx0 or by1 <= by0:
+            continue
+        a, b, c, d, e, f = Tinv
+        data = (a, b, a * bx0 + b * by0 + c, d, e, d * bx0 + e * by0 + f)      # (x, y) de la vignette -> source
+        patch = src_img.transform((bx1 - bx0, by1 - by0), Image.AFFINE, data, resample=Image.BICUBIC)
+        mask = Image.new("L", (bx1 - bx0, by1 - by0), 0)
+        ImageDraw.Draw(mask).polygon([(px - bx0, py - by0) for px, py in dc], fill=255)
+        dst_img.paste(patch, (bx0, by0), mask)
+
+
+def _leak_suspects(words, pz, strict):
+    """2e filet : sur le rendu APRÈS masquage, tout candidat qui n'est pas un pseudonyme connu est suspect.
+    Un pseudonyme mal relu par l'OCR (devise collée « … 5816 1 CHF », un caractère faux) n'est pas un suspect :
+    tolérance Levenshtein ≤ 1 (≤ 2 au-delà de 12 caractères) après retrait d'un jeton alphabétique final."""
+    reps = {norm(rep).casefold() for (_, rep) in pz.exact.values()} | {norm(g).casefold() for g in pz.generated.values()}
+    by_len = {}
+    for r_ in reps:
+        by_len.setdefault(len(r_), []).append(r_)
+
+    def is_pseudonym(v):
+        v2 = re.sub(r"\s+[A-Za-z]{2,4}$", "", v)              # « CHF », « EUR » collés par l'OCR
+        for cand in {norm(v).casefold(), norm(v2).casefold()}:
+            if cand in reps:
+                return True
+            cap = 2 if len(cand) > 12 else 1
+            for L in range(len(cand) - cap, len(cand) + cap + 1):
+                if any(_levenshtein(cand, r_, cap) <= cap for r_ in by_len.get(L, ())):
+                    return True
+        return False
+    return [c for c in _collect_candidates(words, pz, strict) if not is_pseudonym(c[2])]
+
+
+# ---------------------------------------------------------------------------
+# PDF : signatures vectorielles / annotations / widgets
+# ---------------------------------------------------------------------------
+def _pdf_signature_labels(page):
+    out = []
+    for w in page.get_text("words"):
+        t = w[4].strip().casefold().strip(".,;:()")
+        if t in SIGNATURE_WORDS or t.rstrip(":") in SIGNATURE_WORDS:
+            out.append((w[0], w[1], w[2], w[3]))
+    return out
+
+
+def _rect_in_signature_zone(page, r, labels, dist_pt=100):
+    if (r.y0 + r.y1) / 2 >= page.rect.y0 + 2 * page.rect.height / 3:
+        return True
+    return _near_label((r.x0, r.y0, r.x1, r.y1), labels, dist=dist_pt)
+
+
+def _cover_vector_signatures(page, fitz):
+    """Tracés courbes (items 'c' de get_drawings) regroupés par proximité, filtrés comme le raster (localisation, ratio
+    1,5–10, taille ≥ 30×8 pt, ni rectangle ni ligne) -> redaction (retrait des tracés couverts) + rectangle couleur de fond.
+    Annotations /Ink et champs de signature (/Sig) -> supprimés puis recouverts. Log SIGNATURE_COVERED par zone."""
+    log = []
+    labels = _pdf_signature_labels(page)
+    groups = []
+    for d in page.get_drawings():
+        items = d.get("items", [])
+        kinds = [it[0] for it in items]
+        if "c" not in kinds:
+            continue                                   # rectangles, lignes, filets : pas un paraphe
+        r = d["rect"]
+        for g in groups:
+            if r.x0 <= g["rect"].x1 + 20 and r.x1 >= g["rect"].x0 - 20 and r.y0 <= g["rect"].y1 + 15 and r.y1 >= g["rect"].y0 - 15:
+                g["rect"] |= r; g["n"] += 1; g["curves"] += kinds.count("c"); break
+        else:
+            groups.append({"rect": fitz.Rect(r), "n": 1, "curves": kinds.count("c")})
+    zones = []
+    for g in groups:
+        r = g["rect"]; bw, bh = r.width, r.height
+        why = None
+        if bh < 8 or bw < 30:
+            why = "too_small"
+        elif not (1.5 <= bw / max(bh, 0.1) <= 10):
+            why = "aspect"
+        elif g["curves"] < 2:
+            why = "single_curve"
+        elif not _rect_in_signature_zone(page, r, labels):
+            why = "location"
+        if why:
+            log.append({"type": "SIGNATURE", "match": "rejected_vector", "reason": why, "box": [round(v, 1) for v in r]})
+            continue
+        zones.append(("vector", r))
+    for annot in list(page.annots() or []):
+        if annot.type[0] == fitz.PDF_ANNOT_INK:
+            zones.append(("ink_annot", fitz.Rect(annot.rect))); page.delete_annot(annot)
+    for wdg in list(page.widgets() or []):
+        if wdg.field_type == fitz.PDF_WIDGET_TYPE_SIGNATURE:
+            zones.append(("sig_widget", fitz.Rect(wdg.rect)))
+            try:
+                page.delete_widget(wdg)
+            except Exception:
+                pass
+    if not zones:
+        return log
+    for kind, r in zones:
+        box = fitz.Rect(r.x0 - 4, r.y0 - 4, r.x1 + 4, r.y1 + 4) & page.rect
+        # couleur de fond locale : médiane du rendu autour de la boîte
+        try:
+            pix = page.get_pixmap(clip=fitz.Rect(box.x0 - 6, box.y0 - 6, box.x1 + 6, box.y1 + 6) & page.rect, dpi=72)
+            import numpy as np
+            a = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)[:, :, :3]
+            edge = np.concatenate([a[0], a[-1], a[:, 0], a[:, -1]])
+            bg = tuple(float(v) / 255 for v in np.median(edge, axis=0))
+        except Exception:
+            bg = (1, 1, 1)
+        page.add_redact_annot(box, fill=bg)
+        log.append({"type": "SIGNATURE_COVERED", "match": "covered_" + kind, "box": [round(v, 1) for v in box], "original": None, "replacement": None})
+    # la redaction retire les tracés entièrement couverts et peint le fond ; les cadres/filets qui ne font que
+    # traverser la boîte ne sont pas retirés (REMOVE_IF_COVERED, pas IF_TOUCHED)
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED)
+    return log
+
+
+def sanitize_scanned_page(page, doc, pz, strict, dpi=SCAN_DPI):
+    """Page scannée : rendu (rotation /Rotate et orientation de l'image appliquées) -> gris + contraste -> déskew ->
+    OCR -> masquage sur le rendu redressé -> reprojection des zones réécrites sur l'image brute (géométrie d'origine
+    conservée) -> replace_image. Puis 2e passe OCR sur la page masquée : valeur encore lue -> LEAK_SUSPECT + recouverte.
+    Sans XObject (images inline BI/EI) : le rendu masqué remplace le contenu de la page (fail-closed, journalisé)."""
+    import fitz
+    import numpy as np
+    from PIL import Image
+    fonts = _font_candidates()
+    hit = _covering_image(page, doc)
+    pix = page.get_pixmap(dpi=dpi)
+    render = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    gray = _prep_scan(render)
+    skew = _estimate_skew(gray)
+    D = gray.rotate(skew, resample=Image.BICUBIC, fillcolor=255).convert("RGB")     # pour l'OCR
+    Dp = render.rotate(skew, resample=Image.BICUBIC, fillcolor=(255, 255, 255))     # pour la peinture (couleurs)
+    words = _ocr_words(D, (1,))
+    cands = _collect_candidates(words, pz, strict)
+    done, log = _paint_candidates(Dp, cands, fonts)
+    try:
+        sig = _cover_signatures(Dp, words, done, apply=os.environ.get("COVER_SIGNATURES", "1") == "1")
+        log += sig; done += [tuple(e["box"]) for e in sig if e.get("match") == "covered"]
+    except Exception as exc:  # noqa
+        log.append({"type": "SIGNATURE", "match": "detect_failed", "error": str(exc)})
+    info = {"page": page.number + 1, "scanned": True, "skew": skew, "dpi": dpi, "masked": len(done),
+            "method": "xobject" if hit else "inline_render", "rotate": page.rotation}
+
+    # D (rendu redressé) -> rendu -> point page (tourné) -> point page (non tourné) -> unité image -> pixel brut
+    rot = _pil_rotate_matrix(render.width, render.height, skew)          # D (x, y) -> rendu (x, y)
+
+    def apply_replacement(painted, boxes, tag):
+        if not boxes:
+            return
+        if hit:
+            xref, rect, M = hit
+            raw_info = doc.extract_image(xref)
+            raw = Image.open(io.BytesIO(raw_info["image"])).convert("RGB")
+            Minv = ~M
+            k = 72.0 / dpi
+
+            def d2raw(x, y):
+                rx, ry = _affine_apply(rot, x, y)
+                pt = fitz.Point(rx * k, ry * k) * page.derotation_matrix * Minv
+                return pt.x * raw.width, pt.y * raw.height
+            src = [(0, 0), (1000, 0), (0, 1000)]
+            T = _affine_from_points(src, [d2raw(*q) for q in src])
+            _transfer_patches(painted, raw, boxes, T)
+            buf = io.BytesIO()
+            if raw_info["ext"].lower() in ("jpeg", "jpg"):
+                raw.save(buf, "JPEG", quality=80)
+            else:
+                raw.save(buf, "PNG")
+            page.replace_image(xref, stream=buf.getvalue())
+        else:
+            # pas de XObject : le rendu masqué (ramené à la géométrie du rendu) devient la page
+            back = painted.rotate(-skew, resample=Image.BICUBIC, fillcolor=(255, 255, 255))
+            buf = io.BytesIO(); back.save(buf, "JPEG", quality=80)
+            for cx in page.get_contents():
+                doc.update_stream(cx, b"")
+            # le rendu est dans l'orientation d'AFFICHAGE : on l'insère dans le mediabox (non tourné) avec rotate=/Rotate
+            # (vérifié empiriquement sur une page /Rotate 90 : seule cette combinaison relit droit)
+            page.insert_image(page.mediabox, stream=buf.getvalue(), rotate=page.rotation)
+            log.append({"type": "SCAN_INLINE_REPLACED", "match": tag,
+                        "hint": "page sans XObject image : contenu remplacé par le rendu masqué (revue conseillée)"})
+
+    apply_replacement(Dp, done, "first_pass")
+    # ---- 2e filet : OCR du rendu masqué ----
+    pix2 = page.get_pixmap(dpi=dpi)
+    render2 = Image.frombytes("RGB", (pix2.width, pix2.height), pix2.samples)
+    D2 = _prep_scan(render2).rotate(skew, resample=Image.BICUBIC, fillcolor=255).convert("RGB")
+    words2 = _ocr_words(D2, (1,))
+    suspects = _leak_suspects(words2, pz, strict)
+    if suspects:
+        Dp2 = render2.rotate(skew, resample=Image.BICUBIC, fillcolor=(255, 255, 255))
+        done2, log2 = _paint_candidates(Dp2, suspects, fonts, extra_tag="LEAK_SUSPECT")
+        for e in log2:
+            e["type_leak"] = e["type"]; e["type"] = "LEAK_SUSPECT"
+        log += log2
+        apply_replacement(Dp2, done2, "second_pass")
+        info["leak_suspects_covered"] = len(done2)
+    info["unread_ink"] = None
+    return info, log
+
+
 def sanitize_pdf(src, dst, pz, strict):
     try:
         import fitz  # PyMuPDF
     except ImportError:
         return {"skipped": "PyMuPDF (fitz) non disponible dans cet environnement — installer `pip install pymupdf` pour la branche PDF"}
     doc = fitz.open(src)
-    log, img_log = [], []
+    log, img_log, pages_log = [], [], []
     for page in doc:
+        words_on_page = page.get_text("words")
+        if not words_on_page:
+            # page sans couche texte : scannée si une image la couvre (ou images inline -> rendu) ; vide sinon
+            blank = not page.get_images(full=True) and not page.get_drawings()
+            if not blank:
+                info, l = sanitize_scanned_page(page, doc, pz, strict)
+                pages_log.append(info)
+                img_log.append({"page": page.number + 1, "xref": None, "scanned": True, "replacements": l})
+                continue
         text = page.get_text("text")
         spans = pz.detect(text, strict)
         uniq = {}
