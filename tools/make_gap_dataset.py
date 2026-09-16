@@ -428,6 +428,154 @@ def make_signed_form(ents, gt, out_dir, rng):
     print("  %s (p.1 paraphe raster, p.2 paraphe vectoriel) + %s (200 dpi)" % (name, png))
 
 
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Niveau 2 : tests dédiés pour ce qui n'était validé que par lecture du code
+#   #3 cohérence texte / tableau / en-tête-pied / image  -> Coherence_FICTIF.docx
+#   #4 PII uniquement en en-tête / pied, 4 pages          -> Pied_de_page_FICTIF.docx + Pied_de_page_FICTIF.pdf
+#   #1 templates variables                                 -> Template_B_FICTIF.docx (fiche clé/valeur, MAJUSCULES, date DE,
+#                                                             IBAN sans espaces) + Template_C_FICTIF.pdf (rapport labo 2 colonnes)
+# ---------------------------------------------------------------------------------------------------------------------
+def _mapping_has(ds, value):
+    with open(os.path.join(ds, "ground_truth/mapping_by_value.csv"), encoding="utf-8") as f:
+        return any(r["original_value"] == value for r in csv.DictReader(f))
+
+
+def _gt_variant(gt, document, loc, dtype, value, rep, eid, **kw):
+    """Ligne GT avec une VALEUR VARIANTE (majuscules, sans espaces, date longue) et son pseudonyme attendu."""
+    gt.n += 1
+    gt.rows.append(dict(gt_id="GAP%05d" % gt.n, document=document, location_type=loc, page=kw.get("page", ""), sheet="", cell="",
+                        paragraph=kw.get("paragraph", ""), image_file=kw.get("image_file", ""), section=kw.get("section", ""),
+                        data_type=dtype, value=value, entity_id=eid, entity_role="patient", variant=kw.get("variant", "text"),
+                        language=kw.get("language", "fr"), expected_action="PSEUDONYMIZE", expected_replacement=rep,
+                        strict_replacement=rep, securiti_data_element_hint=HINT.get(dtype, dtype), native_or_custom="natif"))
+
+
+def make_level2(ds, ents, gt, out_dir, tmp):
+    from docx import Document
+    from docx.enum.section import WD_ORIENT
+    from docx.enum.text import WD_BREAK
+    from docx.shared import Pt, Inches
+    P = "P001"; e = ents[P]; nm = full_name(ents, P)
+
+    # ---- #3 Coherence_FICTIF.docx : la même personne sur 5 surfaces --------------------------------------------------
+    name = "Coherence_FICTIF.docx"
+    d = Document()
+    sec = d.sections[0]
+    sec.header.paragraphs[0].text = "Dossier %s — %s" % (nm, e["PATIENT_ID"][0])
+    sec.footer.paragraphs[0].text = "%s · AVS %s · Document FICTIF" % (nm, e["AHV_NUMBER"][0])
+    d.add_heading("Test de cohérence multi-surfaces (FICTIF)", level=1)
+    d.add_paragraph("Le patient %s (AVS %s) est remboursé sur le compte %s." % (nm, e["AHV_NUMBER"][0], e["IBAN"][0]))
+    t = d.add_table(rows=1, cols=2); t.style = "Table Grid"
+    t.rows[0].cells[0].text = "Champ"; t.rows[0].cells[1].text = "Valeur"
+    for k, v in (("Nom, prénom", nm), ("AVS", e["AHV_NUMBER"][0]), ("IBAN", e["IBAN"][0]), ("N° patient", e["PATIENT_ID"][0])):
+        row = t.add_row().cells; row[0].text = k; row[1].text = v
+    d.add_paragraph("Capture d'écran du système source :")
+    img = Image.new("RGB", (1400, 260), (255, 255, 255)); dr = ImageDraw.Draw(img); f = font(34)
+    for i, line in enumerate(("Patient : %s" % nm, "AVS : %s" % e["AHV_NUMBER"][0], "IBAN : %s" % e["IBAN"][0])):
+        dr.text((30, 25 + i * 75), line, font=f, fill=(20, 20, 20))
+    pimg = os.path.join(tmp, "coherence_capture.png"); img.save(pimg)
+    d.add_picture(pimg, width=Inches(6))
+    d.save(os.path.join(out_dir, name))
+    for section, loc in (("header", "text"), ("footer", "text"), ("paragraph", "text"), ("table", "text")):
+        types = {"header": ["FIRST_NAME", "LAST_NAME", "PATIENT_ID"], "footer": ["FIRST_NAME", "LAST_NAME", "AHV_NUMBER"],
+                 "paragraph": ["FIRST_NAME", "LAST_NAME", "AHV_NUMBER", "IBAN"], "table": ["FIRST_NAME", "LAST_NAME", "AHV_NUMBER", "IBAN", "PATIENT_ID"]}[section]
+        gt.add_person(name, loc, P, types, section=section, variant="coherence_" + section)
+    gt.add_person(name, "image", P, ["FIRST_NAME", "LAST_NAME", "AHV_NUMBER", "IBAN"], image_file="word/media/image1.png", section="image", variant="coherence_image")
+    print("  %s : même personne en en-tête, pied, paragraphe, tableau et image" % name)
+
+    # ---- #4 Pied_de_page_FICTIF.docx : PII UNIQUEMENT en en-tête/pied, 4 pages ------------------------------------------
+    name = "Pied_de_page_FICTIF.docx"
+    d = Document(); sec = d.sections[0]
+    sec.header.paragraphs[0].text = "Confidentiel — %s" % nm
+    sec.footer.paragraphs[0].text = "%s · %s · Document FICTIF" % (e["PATIENT_ID"][0], nm)
+    for pno in range(1, 5):
+        d.add_heading("Protocole clinique FICTIF — section %d" % pno, level=1)
+        for _ in range(6):
+            d.add_paragraph("Texte de protocole sans donnée personnelle. Posologie standard, suivi hebdomadaire, "
+                            "critères d'inclusion et d'exclusion décrits en annexe. Référence interne FA-2026-10100.")
+        if pno < 4:
+            d.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+    d.save(os.path.join(out_dir, name))
+    gt.add_person(name, "text", P, ["FIRST_NAME", "LAST_NAME"], section="header", variant="header_only")
+    gt.add_person(name, "text", P, ["FIRST_NAME", "LAST_NAME", "PATIENT_ID"], section="footer", variant="footer_only")
+    gt.decoy(name, "INVOICE_NUMBER", "FA-2026-10100", "n° de facture dans le corps — pas du PII")
+    print("  %s : 4 pages, PII seulement en en-tête/pied" % name)
+
+    # ---- #4 Pied_de_page_FICTIF.pdf : idem en PDF natif, pied répété sur chaque page ------------------------------------
+    name = "Pied_de_page_FICTIF.pdf"
+    doc = fitz.open()
+    for pno in range(1, 5):
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((60, 40), "AVS %s — Confidentiel" % e["AHV_NUMBER"][0], fontsize=9, color=(0.3, 0.3, 0.3))
+        page.insert_text((60, 90), "Protocole clinique FICTIF — section %d" % pno, fontsize=14, fontname="hebo")
+        page.insert_textbox(fitz.Rect(60, 110, 535, 700), ("Texte de protocole sans donnée personnelle. Posologie standard, suivi "
+                            "hebdomadaire, critères d'inclusion et d'exclusion décrits en annexe. Référence interne FA-2026-10100. ") * 6, fontsize=10)
+        page.insert_text((60, 810), "Patient %s — %s — page %d/4 — Document FICTIF" % (nm, e["PATIENT_ID"][0], pno), fontsize=8, color=(0.4, 0.4, 0.4))
+        gt.add_person(name, "text", P, ["AHV_NUMBER"], page=str(pno), section="header", variant="header_only")
+        gt.add_person(name, "text", P, ["FIRST_NAME", "LAST_NAME", "PATIENT_ID"], page=str(pno), section="footer", variant="footer_only")
+    doc.save(os.path.join(out_dir, name), deflate=True)
+    gt.decoy(name, "INVOICE_NUMBER", "FA-2026-10100", "n° de facture dans le corps — pas du PII")
+    print("  %s : 4 pages, PII seulement en en-tête/pied" % name)
+
+    # ---- #1 Template_B_FICTIF.docx : fiche clé/valeur paysage, MAJUSCULES, date longue DE, IBAN sans espaces -------------
+    name = "Template_B_FICTIF.docx"
+    last_up, last_up_rep = e["LAST_NAME"][0].upper(), e["LAST_NAME"][1].upper()
+    dob_de, dob_de_rep = "14. März 1962", "5. November 1962"
+    iban_ns, iban_ns_rep = e["IBAN"][0].replace(" ", ""), e["IBAN"][1].replace(" ", "")
+    assert _mapping_has(ds, last_up) and _mapping_has(ds, dob_de), "variantes attendues dans mapping_by_value.csv"
+    d = Document(); sec = d.sections[0]
+    sec.orientation = WD_ORIENT.LANDSCAPE; sec.page_width, sec.page_height = sec.page_height, sec.page_width
+    d.add_heading("PATIENTENSTAMMBLATT (FIKTIV) — Vorlage B", level=1)
+    t = d.add_table(rows=0, cols=4); t.style = "Light Grid Accent 1"
+    pairs = [("Name", last_up), ("Vorname", e["FIRST_NAME"][0]), ("Geburtsdatum", dob_de), ("Patienten-Nr.", e["PATIENT_ID"][0]),
+             ("IBAN", iban_ns), ("AHV", e["AHV_NUMBER"][0]), ("Telefon", e["PHONE"][0]), ("E-Mail", e["EMAIL"][0]),
+             ("Adresse", e["STREET_ADDRESS"][0]), ("PLZ/Ort", e["POSTAL_CITY"][0]), ("Rechnung", "FA-2026-10100"), ("Studie", "CT-2026-0042")]
+    for i in range(0, len(pairs), 2):
+        row = t.add_row().cells
+        row[0].text, row[1].text = pairs[i]; row[2].text, row[3].text = pairs[i + 1]
+        for c in (row[0], row[2]):
+            for r_ in c.paragraphs[0].runs: r_.bold = True
+    d.add_paragraph("")
+    d.add_paragraph("Bemerkung: Herr %s %s wurde am %s geboren; Rückerstattung auf %s." % (last_up, e["FIRST_NAME"][0], dob_de, iban_ns))
+    d.save(os.path.join(out_dir, name))
+    _gt_variant(gt, name, "text", "LAST_NAME", last_up, last_up_rep, P, section="table", variant="template_B_uppercase", language="de")
+    _gt_variant(gt, name, "text", "DATE_OF_BIRTH", dob_de, dob_de_rep, P, section="table", variant="template_B_date_long_de", language="de")
+    _gt_variant(gt, name, "text", "IBAN", iban_ns, iban_ns_rep, P, section="table", variant="template_B_iban_nospace", language="de")
+    gt.add_person(name, "text", P, ["FIRST_NAME", "PATIENT_ID", "AHV_NUMBER", "PHONE", "EMAIL", "STREET_ADDRESS", "POSTAL_CITY"], section="table", variant="template_B", language="de")
+    gt.decoy(name, "INVOICE_NUMBER", "FA-2026-10100", "n° de facture — pas du PII"); gt.decoy(name, "CONTRACT_REF", "CT-2026-0042", "référence étude — pas du PII")
+    print("  %s : fiche paysage clé/valeur, MAJUSCULES, date longue DE, IBAN sans espaces" % name)
+
+    # ---- #1 Template_C_FICTIF.pdf : rapport de laboratoire deux colonnes, corps 8 pt, ordre différent --------------------
+    name = "Template_C_FICTIF.pdf"
+    doc = fitz.open(); page = doc.new_page(width=595, height=842)
+    page.insert_text((40, 50), "LABORATOIRE CENTRAL (FICTIF) — Rapport d'analyses — Modèle C", fontsize=12, fontname="hebo")
+    page.draw_line((40, 58), (555, 58), width=0.8)
+    left = ("Patient : %s %s\nNé le : %s\nN° patient : %s\nAVS : %s\nCourriel : %s\nTél. : %s" %
+            (last_up, e["FIRST_NAME"][0], dob_de, e["PATIENT_ID"][0], e["AHV_NUMBER"][0], e["EMAIL"][0], e["PHONE"][0]))
+    right = ("Prescripteur : Dr Anne Genoud (FICTIF)\nPrélèvement : 09.09.2026 07:45\nRéf. dossier : LAB-2026-00917\n"
+             "Facturation : IBAN %s\nRemarque : à jeun, hémolyse absente" % iban_ns)
+    page.insert_textbox(fitz.Rect(40, 70, 300, 200), left, fontsize=8, fontname="helv")
+    page.insert_textbox(fitz.Rect(310, 70, 555, 200), right, fontsize=8, fontname="helv")
+    y = 220
+    page.insert_text((40, y), "Analyte", fontsize=8, fontname="hebo"); page.insert_text((250, y), "Résultat", fontsize=8, fontname="hebo")
+    page.insert_text((330, y), "Unité", fontsize=8, fontname="hebo"); page.insert_text((420, y), "Référence", fontsize=8, fontname="hebo")
+    for i, (an, res, un, ref) in enumerate((("Glucose", "5.6", "mmol/L", "3.9-5.8"), ("HbA1c", "6.1", "%", "< 5.7"), ("Créatinine", "88", "µmol/L", "62–106"),
+                                            ("Potassium", "4.2", "mmol/L", "3.5–5.1"), ("CRP", "3.0", "mg/L", "< 5"), ("Hémoglobine", "14.1", "g/dL", "13.5–17.5"))):
+        yy = y + 14 * (i + 1)
+        for x, v in ((40, an), (250, res), (330, un), (420, ref)):
+            page.insert_text((x, yy), v, fontsize=8)
+    page.insert_text((40, 820), "Document FICTIF — jeu de test — aucune donnée réelle", fontsize=7, color=(0.5, 0.5, 0.5))
+    doc.save(os.path.join(out_dir, name), deflate=True)
+    _gt_variant(gt, name, "text", "LAST_NAME", last_up, last_up_rep, P, page="1", section="body", variant="template_C_uppercase")
+    _gt_variant(gt, name, "text", "DATE_OF_BIRTH", dob_de, dob_de_rep, P, page="1", section="body", variant="template_C_date_long_de")
+    _gt_variant(gt, name, "text", "IBAN", iban_ns, iban_ns_rep, P, page="1", section="body", variant="template_C_iban_nospace")
+    gt.add_person(name, "text", P, ["FIRST_NAME", "PATIENT_ID", "AHV_NUMBER", "EMAIL", "PHONE"], page="1", section="body", variant="template_C")
+    gt.decoy(name, "LAB_REF", "LAB-2026-00917", "référence de dossier labo — pas du PII", page="1")
+    gt.decoy(name, "LAB_VALUE", "3.9-5.8", "intervalle de référence — pas du PII", page="1")
+    print("  %s : rapport labo 2 colonnes, 8 pt, ordre différent" % name)
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -456,6 +604,7 @@ def main():
     xlsx_src, _ = make_embedded_docx(ents, gt, out_dir, tmp)
     make_attached_pdf(ents, gt, out_dir, xlsx_src, tmp)
     make_signed_form(ents, gt, out_dir, rng)
+    make_level2(ds, ents, gt, out_dir, tmp)
     # CSV
     with open(os.path.join(gt_dir, "ground_truth_gap.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=GT_COLS); w.writeheader()
