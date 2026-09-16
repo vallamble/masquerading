@@ -99,6 +99,20 @@ cd deploy && cp .env.example .env   # then fill in the secrets
 docker stack deploy -c docker-compose.yml masquerading   # or deploy via Portainer
 ```
 
+## Status (2026-09-16)
+
+| Check | Result |
+|---|---|
+| POC dataset (9 files, 4 522 ground-truth rows) | **0 leaks / 3 717**, 0 decoys modified / 154, 305 pages and 4 images preserved, 1 min 19 |
+| Gap dataset (RTF, scanned PDF with `/Rotate 90`, DOCX with embedded XLSX + preview, PDF with attachment, signed forms) | **0 leaks / 314**, 0 decoys / 8, 3/3 signatures at 0 % residual ink, 6/6 frames and rules intact |
+| End-to-end on the deployed service (Graph upload → `POST /sanitize` → `Documents/Output/gap/`) | 6/6 files processed in < 1 min, same evaluation result as local |
+| Container image | 657 MB → 1.12 GB (LibreOffice writer, headless) |
+
+Known limits, logged for review rather than processed: OLE `.bin` objects that are not Office packages, EMF/WMF previews
+of embedded objects (Word-generated), a signature drawn over text (the text under it is erased too), native RTF patching
+(LibreOffice round trip is used instead). Signature thresholds were tuned on synthetic strokes; check them on real
+signatures before a demo.
+
 ## Validation
 
 ```bash
