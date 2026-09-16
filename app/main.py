@@ -66,13 +66,18 @@ def _persist_generated(pz):
         json.dump(pz.generated, f, ensure_ascii=False, indent=1)
 
 
+# Formats acceptés par l'API (toute autre extension est ignorée et journalisée).
+HANDLERS = {
+    ".docx": sr.sanitize_docx, ".xlsx": sr.sanitize_xlsx, ".pdf": sr.sanitize_pdf, ".rtf": sr.sanitize_rtf,
+    ".png": sr.sanitize_image_file, ".jpg": sr.sanitize_image_file, ".jpeg": sr.sanitize_image_file,
+}
+SUPPORTED_FORMATS = sorted(HANDLERS)
+
+
 def _sanitize_one(gc: GraphClient, pz, rel_path: str):
     """rel_path est relatif à INBOUND (ex. 'images/x.png')."""
     ext = os.path.splitext(rel_path)[1].lower()
-    handler = {
-        ".docx": sr.sanitize_docx, ".xlsx": sr.sanitize_xlsx, ".pdf": sr.sanitize_pdf,
-        ".png": sr.sanitize_image_file, ".jpg": sr.sanitize_image_file, ".jpeg": sr.sanitize_image_file,
-    }.get(ext)
+    handler = HANDLERS.get(ext)
     if handler is None:
         log.info("ignoré (extension non gérée): %s", rel_path)
         return {"skipped": ext}
@@ -181,7 +186,7 @@ class ScanReq(BaseModel):
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok", "queue": jobs.qsize(), **state}
+    return {"status": "ok", "queue": jobs.qsize(), "formats": SUPPORTED_FORMATS, **state}
 
 
 def _load_mapping():
