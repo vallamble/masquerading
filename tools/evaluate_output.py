@@ -70,17 +70,143 @@ def ocr_text(img_bytes_or_path):
     return txt
 
 
-def extract(path):
+SOFFICE_CANDIDATES = [os.environ.get("SOFFICE", ""), "/usr/bin/soffice", "/usr/lib/libreoffice/program/soffice",
+                      os.path.expanduser("~/Applications/LibreOffice.app/Contents/MacOS/soffice"),
+                      "/Applications/LibreOffice.app/Contents/MacOS/soffice"]
+
+
+def soffice_bin():
+    for c in SOFFICE_CANDIDATES:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+def soffice_convert(src, fmt, outdir):
+    """Conversion LibreOffice headless avec profil utilisateur isolé (deux conversions simultanées ne se bloquent pas)."""
+    exe = soffice_bin()
+    if not exe:
+        raise RuntimeError("LibreOffice (soffice) introuvable — nécessaire pour l'évaluation RTF")
+    prof = tempfile.mkdtemp(prefix="lo_eval_")
+    subprocess.run([exe, "--headless", "--norestore", "-env:UserInstallation=file://%s" % prof, "--convert-to", fmt,
+                    "--outdir", outdir, src], capture_output=True, text=True, timeout=180)
+    import shutil; shutil.rmtree(prof, ignore_errors=True)
+    out = os.path.join(outdir, os.path.splitext(os.path.basename(src))[0] + "." + fmt)
+    if not os.path.exists(out):
+        raise RuntimeError("conversion LibreOffice %s -> %s échouée" % (src, fmt))
+    return out
+
+
+def docx_full_text(path):
+    """Texte DOCX : paragraphes, tableaux, en-têtes et pieds de page de chaque section (+ locs)."""
+    from docx import Document
+    d = Document(path)
+    parts, locs = [], {}
+    for i, p in enumerate(d.paragraphs):
+        parts.append(p.text); locs["paragraph:%d" % i] = p.text
+    for ti, t in enumerate(d.tables):
+        for ri, row in enumerate(t.rows):
+            for ci, c in enumerate(row.cells):
+                parts.append(c.text); locs["table%d!r%d,c%d" % (ti, ri, ci)] = c.text
+    for si, sec in enumerate(d.sections):
+        for kind, hf in (("header", sec.header), ("footer", sec.footer)):
+            txt = "\n".join(p.text for p in hf.paragraphs) + "\n" + "\n".join(c.text for t in hf.tables for r in t.rows for c in r.cells)
+            parts.append(txt); locs["%s:%d" % (kind, si)] = txt
+    return "\n".join(parts), locs, {"paragraphs": len(d.paragraphs), "tables": len(d.tables), "sections": len(d.sections)}
+
+
+def ocr_pdf_page(page, dpi=300):
+    """Rendu de la page (rotation /Rotate appliquée) -> OCR. Utilisé pour les pages SANS couche texte (scan)."""
+    pix = page.get_pixmap(dpi=dpi)
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False); tmp.close()
+    pix.save(tmp.name)
+    txt = ""
+    for psm in ("6", "11"):
+        try:
+            txt += subprocess.run(["tesseract", tmp.name, "stdout", "--psm", psm], capture_output=True, text=True, timeout=300).stdout + "\n"
+        except Exception:
+            pass
+    os.unlink(tmp.name)
+    return txt
+
+
+def ink_ratio_pdf(path, page_no, box, dpi=200):
+    import fitz, numpy as np
+    doc = fitz.open(path); page = doc[page_no - 1]
+    pix = page.get_pixmap(dpi=dpi, clip=fitz.Rect(*box))
+    a = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)[:, :, :3]
+    return float((a.min(axis=2) < 128).mean())
+
+
+def ink_ratio_img(path, box):
+    import numpy as np
+    from PIL import Image
+    im = Image.open(path).convert("RGB").crop(tuple(int(v) for v in box))
+    a = np.asarray(im)
+    return float((a.min(axis=2) < 128).mean()) if a.size else 0.0
+
+
+def extract_embedded(path, depth=0):
+    """Objets imbriqués : DOCX word/embeddings/*, XLSX xl/embeddings/*, pièces jointes PDF. Retourne
+    [(nom, texte, image_texts, stats)] en évaluant récursivement (profondeur max 3)."""
+    out = []
+    if depth > 3:
+        return out
+    ext = os.path.splitext(path)[1].lower()
+    tmpd = tempfile.mkdtemp(prefix="emb_eval_")
+    members = []
+    if ext in (".docx", ".xlsx"):
+        with zipfile.ZipFile(path) as z:
+            for n in z.namelist():
+                if n.startswith(("word/embeddings/", "xl/embeddings/")):
+                    dst = os.path.join(tmpd, os.path.basename(n)); open(dst, "wb").write(z.read(n)); members.append((n, dst))
+    elif ext == ".pdf":
+        try:
+            import fitz
+            doc = fitz.open(path)
+            for i in range(doc.embfile_count()):
+                info = doc.embfile_info(i); fn = info.get("filename") or info.get("name") or "embfile%d" % i
+                dst = os.path.join(tmpd, os.path.basename(fn)); open(dst, "wb").write(doc.embfile_get(i)); members.append(("embfile:" + fn, dst))
+        except Exception as e:  # noqa
+            out.append(("embfile_error", repr(e), [], {}))
+    for name, dst in members:
+        try:
+            ex = extract(dst, depth + 1)
+            out.append((name, ex["text"], ex["image_texts"], ex["stats"]))
+            out += [("%s > %s" % (name, n2), t2, i2, s2) for n2, t2, i2, s2 in ex.get("embedded", [])]
+        except Exception as e:  # noqa
+            out.append((name, "", [], {"error": repr(e)}))
+    return out
+
+
+def extract(path, depth=0):
     """Retourne dict : pages(list[str]) pour PDF, text(str), image_texts(list[str]), stats(dict),
     locs : texte adressable par emplacement ('sheet!cell', 'paragraph:i', 'table0!r,c') pour un contrôle au plus fin."""
     ext = os.path.splitext(path)[1].lower()
-    res = {"pages": None, "text": "", "image_texts": [], "stats": {}, "locs": {}}
+    res = {"pages": None, "text": "", "image_texts": [], "stats": {}, "locs": {}, "page_ocr": {}, "embedded": []}
+    if ext == ".rtf":
+        # RTF : LibreOffice -> DOCX -> python-docx (en-têtes/pieds/tableaux compris ; l'export txt les perd)
+        tmpd = tempfile.mkdtemp(prefix="rtf_eval_")
+        docx_path = soffice_convert(path, "docx", tmpd)
+        res["text"], res["locs"], st = docx_full_text(docx_path)
+        res["stats"].update(st)
+        return res
     if ext == ".pdf":
         import pdfplumber
         from pypdf import PdfReader
         with pdfplumber.open(path) as pdf:
             res["pages"] = [p.extract_text() or "" for p in pdf.pages]
         res["text"] = "\n".join(res["pages"])
+        # pages sans couche texte (scan) : rendu 300 dpi -> OCR (la rotation /Rotate est appliquée par le rendu)
+        try:
+            import fitz
+            doc = fitz.open(path)
+            for i, pg in enumerate(doc):
+                if not res["pages"][i].strip() and pg.get_images():
+                    res["page_ocr"][i + 1] = ocr_pdf_page(pg)
+            res["stats"]["scanned_pages"] = sorted(res["page_ocr"])
+        except Exception as e:  # noqa
+            res["stats"]["scan_ocr_error"] = repr(e)
         n_img = 0
         try:
             rd = PdfReader(path)
@@ -127,6 +253,10 @@ def extract(path):
         from PIL import Image
         with Image.open(path) as im:
             res["stats"].update({"size": im.size})
+    if ext in (".docx", ".xlsx", ".pdf"):
+        res["embedded"] = extract_embedded(path, depth)
+        if res["embedded"]:
+            res["stats"]["embedded"] = [n for n, *_ in res["embedded"]]
     return res
 
 
@@ -179,13 +309,18 @@ def main():
             si, so = os.path.getsize(in_path), os.path.getsize(out_path)
             report["size_delta"][doc] = {"in": si, "out": so, "pct": round(100.0 * (so - si) / max(1, si), 1)}
         img_txt = " ".join(ex["image_texts"])
+        emb_txt = " ".join(t + " " + " ".join(i) for _, t, i, _ in ex.get("embedded", []))
         d = {"leaks": 0, "replacements_present": 0, "to_pseudonymize": 0, "keep_expected": 0, "keep_present": 0,
              "image_to_pseudonymize": 0, "image_leaks": 0, "leak_examples": []}
 
         def scope_text(r):
             """Texte du périmètre le plus fin connu pour la ligne GT (page PDF, cellule(s) XLSX, paragraphe DOCX)."""
             if r["location_type"] == "image":
+                if ex["pages"] is not None and r["page"] and int(r["page"]) in ex.get("page_ocr", {}):
+                    return ex["page_ocr"][int(r["page"])] + " " + img_txt, True     # page scannée : OCR du rendu
                 return img_txt, True
+            if r["location_type"].startswith("embedded"):
+                return emb_txt, False
             if ex["pages"] and r["page"]:
                 pg = int(r["page"])
                 return (ex["pages"][pg - 1] if 1 <= pg <= len(ex["pages"]) else ex["text"]), False
@@ -228,7 +363,7 @@ def main():
         # d'un IBAN (« AT61 … 7252 CHF ») → on retente sans ce jeton avant de déclarer l'IBAN invalide ;
         # (2) les leurres du dataset sont invalides PAR CONSTRUCTION et doivent le rester → ils sont exclus du
         # dénominateur, sinon la métrique punit le comportement attendu.
-        full = ex["text"] + " " + " ".join(ex["image_texts"])
+        full = ex["text"] + " " + " ".join(ex["image_texts"]) + " " + emb_txt + " " + " ".join(ex.get("page_ocr", {}).values())
         iban_re = re.compile(r"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{4}){2,7}(?:[ ]?[A-Z0-9]{1,4})?\b")
 
         def iban_ok(x):
@@ -268,6 +403,51 @@ def main():
         d["keep_rate"] = round(d["keep_present"] / d["keep_expected"], 4) if d["keep_expected"] else None
         report["documents"][doc] = d
 
+    # signatures : encre résiduelle dans chaque boîte (objectif < 2 % de l'encre d'entrée) ; leurres graphiques intacts (± 5 %)
+    if a.signatures and os.path.exists(a.signatures):
+        sig_rows, ok_all = [], True
+        for r in csv.DictReader(open(a.signatures, encoding="utf-8")):
+            box = (float(r["x0"]), float(r["y0"]), float(r["x1"]), float(r["y1"]))
+            ip, op = os.path.join(a.inbound, r["file"]), os.path.join(a.output, r["file"])
+            if not os.path.exists(op):
+                sig_rows.append(dict(r, status="ABSENT")); ok_all = False; continue
+            if r["file"].lower().endswith(".pdf"):
+                i_ink, o_ink = ink_ratio_pdf(ip, int(r["page"]), box), ink_ratio_pdf(op, int(r["page"]), box)
+            else:
+                i_ink, o_ink = ink_ratio_img(ip, box), ink_ratio_img(op, box)
+            resid = o_ink / i_ink if i_ink else 0.0
+            if r["kind"].startswith("signature"):
+                ok = resid < 0.02
+            else:
+                ok = abs(o_ink - i_ink) <= 0.05 * max(i_ink, 1e-9)
+            ok_all = ok_all and ok
+            sig_rows.append(dict(r, ink_in=round(i_ink, 4), ink_out=round(o_ink, 4), residual=round(resid, 4), ok=ok))
+        report["signatures"] = {"rows": sig_rows, "summary": {
+            "ok": ok_all, "signatures": sum(1 for x in sig_rows if x["kind"].startswith("signature")),
+            "signatures_ok": sum(1 for x in sig_rows if x["kind"].startswith("signature") and x.get("ok")),
+            "decoys": sum(1 for x in sig_rows if x["kind"].startswith("decoy")),
+            "decoys_intact": sum(1 for x in sig_rows if x["kind"].startswith("decoy") and x.get("ok")),
+            "residual_max": max([x.get("residual", 0) for x in sig_rows if x["kind"].startswith("signature")] or [0])}}
+    # objets imbriqués : trouvés (par l'évaluateur) vs traités (log du sanitizer, s'il existe)
+    emb = {}
+    for doc in docs:
+        op = os.path.join(a.output, doc)
+        if os.path.exists(op) and op.lower().endswith((".docx", ".xlsx", ".pdf")):
+            found = [n for n, *_ in extract_embedded(op)]
+            if found:
+                emb[doc] = {"found": found}
+    slog = os.path.join(a.output, "sanitization_log.json")
+    if emb and os.path.exists(slog):
+        try:
+            sl = json.load(open(slog, encoding="utf-8"))["files"]
+            for doc in emb:
+                e = sl.get(doc, {}).get("embedded", {})
+                emb[doc].update({"processed": e.get("processed", []), "unsupported": e.get("unsupported", [])})
+        except Exception as e:  # noqa
+            emb["log_error"] = repr(e)
+    if emb:
+        report["embedded"] = emb
+
     for t, s in agg.items():
         s["leak_rate"] = round(s["leaked"] / s["to_pseudonymize"], 4) if s["to_pseudonymize"] else None
         s["replacement_rate"] = round(s["replacement_present"] / s["to_pseudonymize"], 4) if s["to_pseudonymize"] else None
@@ -301,6 +481,17 @@ def main():
             md.append("    - fuite : %s" % e)
         for e in d.get("decoys_modified_examples", []):
             md.append("    - leurre modifié (faux positif) : %s" % e)
+    if report.get("signatures"):
+        md += ["", "## Signatures (encre résiduelle) et leurres graphiques", "", "| Fichier | Page | Type | Encre entrée | Encre sortie | Résiduel | OK |", "|---|---|---|---|---|---|---|"]
+        for x in report["signatures"]["rows"]:
+            md.append("| %s | %s | %s | %s | %s | %s | %s |" % (x["file"], x["page"], x["kind"], x.get("ink_in"), x.get("ink_out"), x.get("residual"), x.get("ok", x.get("status"))))
+    if report.get("embedded"):
+        md += ["", "## Objets imbriqués", ""]
+        for doc, e in report["embedded"].items():
+            md.append("- **%s** : trouvés %s ; traités %s ; non traités %s" % (doc, e.get("found"), e.get("processed", "?"), e.get("unsupported", "?")))
+    md += ["", "## Delta de taille par fichier", "", "| Fichier | Entrée (o) | Sortie (o) | Delta |", "|---|---|---|---|"]
+    for doc, v in report["size_delta"].items():
+        md.append("| %s | %d | %d | %+.1f %% |" % (doc, v["in"], v["out"], v["pct"]))
     open(os.path.join(rd, "evaluation_output.md"), "w", encoding="utf-8").write("\n".join(md) + "\n")
     print("\n".join(md))
 
