@@ -412,9 +412,53 @@ def _collect_candidates(words, pz, strict):
     return candidates
 
 
-def _paint_candidates(img, candidates, fonts, extra_tag=None):
+def _line_height_hint(box, words):
+    """Hauteur/position typographiques de la LIGNE : médiane des boîtes des autres mots OCR alignés sur la même ligne.
+    Une boîte OCR isolément trop haute (29 px sur une ligne de 16 px : accent, jambage, deux mots collés) donnait un
+    pseudonyme en gros corps ; on ne s'en sert que si ≥ 2 voisins existent et que la boîte dépasse de > 20 %."""
+    if not words:
+        return None
+    x0, y0, x1, y1 = box
+    bh = max(1, y1 - y0)
+
+    def same_line(w):
+        # recouvrement vertical mutuel ≥ 60 % de la plus petite hauteur, hauteur comparable (0,5–2 ×), pas de chevauchement en x
+        ov = min(y1, w["y"] + w["h"]) - max(y0, w["y"])
+        return (ov >= 0.6 * min(bh, w["h"]) and 0.5 * bh <= w["h"] <= 2.0 * bh
+                and (w["x"] + w["w"] <= x0 or w["x"] >= x1))
+    neigh = [w for w in words if w["conf"] >= 30 and len(w["text"]) >= 2 and same_line(w)]
+    if len(neigh) < 2:
+        return None
+    # hauteur de CAPITALE de la ligne : médiane des voisins SANS jambage ni accent (leur boîte OCR = hauteur des capitales) ;
+    # une boîte OCR incluant un jambage (« Bissig », « Wyler ») ou un accent (« Stéphane ») est plus haute que la ligne.
+    plain = [w for w in neigh if not any(c in "gjpqyQçÇ" for c in w["text"]) and not any(ord(c) > 127 for c in w["text"])]
+    ref = plain if len(plain) >= 2 else neigh
+    hs = sorted(w["h"] for w in ref); tops = sorted(w["y"] for w in ref)
+    cap_h = min(hs[len(hs) // 2], bh)                 # jamais plus haut que la boîte du mot lui-même
+    top = tops[len(tops) // 2] if abs(tops[len(tops) // 2] - y0) <= 0.5 * bh else y0
+    return (top, top + cap_h)
+
+
+def _fit_font_cap(ImageFont, path, cap_h):
+    """Taille telle que la hauteur des capitales (« H ») vaut cap_h : homogène sur une ligne quel que soit le mot."""
+    lo, hi, best = 6, max(8, int(cap_h * 2.5)), None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        f = ImageFont.truetype(path, mid); bb = f.getbbox("H")
+        if bb[3] - bb[1] <= cap_h:
+            best = (f, bb[1]); lo = mid + 1
+        else:
+            hi = mid - 1
+    if best is None:
+        f = ImageFont.truetype(path, 6); best = (f, f.getbbox("H")[1])
+    return best
+
+
+def _paint_candidates(img, candidates, fonts, extra_tag=None, words=None):
     """Recouvre chaque candidat (couleur de fond locale) et écrit le pseudonyme (police/taille ajustées à l'original).
-    Retourne (boîtes traitées, log)."""
+    Taille : hauteur de la ligne (médiane des voisins) plutôt que la boîte OCR du mot seul ; famille : celle qui colle le
+    mieux à l'ensemble de l'image, un mot ne déroge que si sa propre famille réduit son erreur de largeur de > 40 %
+    (les IBAN monospace restent monospace, les noms d'un tableau gardent une seule famille). Retourne (boîtes, log)."""
     from PIL import ImageDraw, ImageFont
     draw = ImageDraw.Draw(img)
     log, done_boxes = [], []
@@ -423,11 +467,23 @@ def _paint_candidates(img, candidates, fonts, extra_tag=None):
         ix = max(0, min(b[2], d[2]) - max(b[0], d[0])); iy = max(0, min(b[3], d[3]) - max(b[1], d[1]))
         return ix * iy > 0.5 * (b[2] - b[0]) * (b[3] - b[1])
 
+    # famille par défaut de l'image : erreur de largeur cumulée sur tous les candidats
+    fam_err = {fam: 0.0 for fam in fonts}
+    for box, dtype, v, rep, how, conf_min in candidates:
+        bx0, by0, bx1, by1 = box
+        hint = _line_height_hint(box, words)
+        bh = (hint[1] - hint[0]) if hint else (by1 - by0)
+        for fam, path in fonts.items():
+            fam_err[fam] += _fit_font(draw, ImageFont, path, v, bx1 - bx0, bh)[1]
+    default_fam = min(fam_err, key=fam_err.get) if fam_err else "sans"
+
     for box, dtype, v, rep, how, conf_min in candidates:
         x0, y0, x1, y1 = box
         if any(overlaps(box, d) for d in done_boxes):
             continue   # déjà traité par une autre passe OCR
         done_boxes.append(box)
+        hint = _line_height_hint(box, words)
+        fy0, fy1 = hint if hint else (y0, y1)          # boîte typographique pour la taille/position du texte
         # couleur de fond : médiane d'une bordure autour de la boîte ; couleur d'encre : pixel le plus sombre
         pad = 3
         border = [img.getpixel((min(max(x, 0), img.width - 1), min(max(y, 0), img.height - 1)))
@@ -438,18 +494,24 @@ def _paint_candidates(img, candidates, fonts, extra_tag=None):
         if sum(bg) - sum(ink) < 90:          # contraste trop faible (fond sombre) : encre par défaut lisible
             ink = (255, 255, 255) if sum(bg) < 384 else (15, 15, 15)
         r = rep.upper() if (v.isupper() and dtype in ("FIRST_NAME", "LAST_NAME")) else rep
-        best = None
-        for fam, path in fonts.items():
-            f, werr, top = _fit_font(draw, ImageFont, path, v, x1 - x0, y1 - y0)
-            if best is None or werr < best[1]:
-                best = (f, werr, top, fam)
-        font, _, top, fam = best
+        if hint:
+            # taille par la hauteur de capitale de la ligne ; famille par erreur de largeur de l'ORIGINAL à cette taille
+            fits = {}
+            for fam_, path in fonts.items():
+                f_, top_ = _fit_font_cap(ImageFont, path, fy1 - fy0)
+                fits[fam_] = (f_, abs(draw.textlength(v, font=f_) - (x1 - x0)) / max(x1 - x0, 1), top_)
+        else:
+            fits = {fam_: _fit_font(draw, ImageFont, path, v, x1 - x0, fy1 - fy0) for fam_, path in fonts.items()}
+        fam = min(fits, key=lambda k: fits[k][1])
+        if default_fam in fits and fits[fam][1] > 0.4 * fits[default_fam][1]:
+            fam = default_fam                          # pas d'écart marqué : famille de l'image
+        font, _, top = fits[fam]
 
         def is_bg(px):
             return sum(abs(px[i] - bg[i]) for i in range(3)) < 45
         free = x1 + pad
-        while free < img.width - 1 and free - x1 < (x1 - x0) * 0.8 + 40:
-            if all(is_bg(img.getpixel((free, yy))) for yy in range(y0, y1, max(1, (y1 - y0) // 4))):
+        while free < img.width - 1 and free - x1 < max((x1 - x0) * 0.8 + 40, (x1 - x0) * 1.5):
+            if all(is_bg(img.getpixel((free, yy))) for yy in range(fy0, fy1, max(1, (fy1 - fy0) // 4))):
                 free += 2
             else:
                 break
@@ -460,8 +522,8 @@ def _paint_candidates(img, candidates, fonts, extra_tag=None):
         xr = x0 + int(draw.textlength(r, font=font)) + pad
         draw.rectangle([x0 - pad, y0 - pad, max(x1, xr) + pad, y1 + pad], fill=bg)
         done_boxes[-1] = (x0 - pad, y0 - pad, max(x1, xr) + pad, y1 + pad)
-        draw.text((x0, y0 - top), r, font=font, fill=ink)
-        entry = {"type": dtype, "original": v, "replacement": r, "box": box, "font": fam, "match": how, "ocr_conf_min": conf_min}
+        draw.text((x0, fy0 - top), r, font=font, fill=ink)
+        entry = {"type": dtype, "original": v, "replacement": r, "box": box, "font": fam, "font_px": font.size, "match": how, "ocr_conf_min": conf_min}
         if extra_tag:
             entry["tag"] = extra_tag
         log.append(entry)
@@ -492,7 +554,7 @@ def sanitize_image_bytes(data, ext, pz: Pseudonymizer, strict=False, ocr_scale=N
         scales = (ocr_scale,)
     words = _ocr_words(img, scales)
     candidates = _collect_candidates(words, pz, strict)
-    done_boxes, log = _paint_candidates(img, candidates, _font_candidates())
+    done_boxes, log = _paint_candidates(img, candidates, _font_candidates(), words=words)
     # signatures manuscrites (recouvrement ciblé, activé par défaut) puis score « encre non lue » (revue manuelle) ;
     # le recouvrement générique de toute encre non lue (_cover_unread_ink, apply=) reste EXPÉRIMENTAL, OFF par défaut.
     if cover_signatures is None:
@@ -1375,7 +1437,7 @@ def sanitize_scanned_page(page, doc, pz, strict, dpi=SCAN_DPI):
     Dp = render.rotate(skew, resample=Image.BICUBIC, fillcolor=(255, 255, 255))     # pour la peinture (couleurs)
     words = _ocr_words(D, (1,))
     cands = _collect_candidates(words, pz, strict)
-    done, log = _paint_candidates(Dp, cands, fonts)
+    done, log = _paint_candidates(Dp, cands, fonts, words=words)
     try:
         sig = _cover_signatures(Dp, words, done, apply=os.environ.get("COVER_SIGNATURES", "1") == "1")
         log += sig; done += [tuple(e["box"]) for e in sig if e.get("match") == "covered"]
@@ -1431,7 +1493,7 @@ def sanitize_scanned_page(page, doc, pz, strict, dpi=SCAN_DPI):
     suspects = _leak_suspects(words2, pz, strict)
     if suspects:
         Dp2 = render2.rotate(skew, resample=Image.BICUBIC, fillcolor=(255, 255, 255))
-        done2, log2 = _paint_candidates(Dp2, suspects, fonts, extra_tag="LEAK_SUSPECT")
+        done2, log2 = _paint_candidates(Dp2, suspects, fonts, extra_tag="LEAK_SUSPECT", words=words2)
         for e in log2:
             e["type_leak"] = e["type"]; e["type"] = "LEAK_SUSPECT"
         log += log2
