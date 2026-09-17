@@ -432,7 +432,8 @@ def _image_slope(img):
 
 
 def _size_clusters(sizes, ratio=1.10):
-    """Regroupe des corps (px) proches (rapport ≤ 1,10 entre voisins triés) : retourne {index: corps médian de sa grappe}.
+    """Regroupe des corps (px) proches (rapport ≤ 1,10 entre voisins triés, ou ≤ 3 px pour les petits corps : à 20 px,
+    2 px de bruit de boîte OCR font déjà 10 %) : retourne {index: corps médian de sa grappe}.
     Les mots d'un même style (corps de texte, titre) prennent le même corps ; deux styles distincts restent distincts."""
     order = sorted(range(len(sizes)), key=lambda i: sizes[i])
     out, group = {}, []
@@ -442,43 +443,179 @@ def _size_clusters(sizes, ratio=1.10):
             for i in group:
                 out[i] = med
     for i in order:
-        if group and sizes[i] > sizes[group[-1]] * ratio:
+        if group and sizes[i] > max(sizes[group[-1]] * ratio, sizes[group[-1]] + 3):
             flush(); group = []
         group.append(i)
     flush()
     return out
 
 
+def _label_components(mask):
+    """Composantes connexes (4-voisinage) d'un masque booléen : (labels int32 1..k, [(x0, y0, x1, y1, n_pixels)])."""
+    import numpy as np
+    h, w = mask.shape
+    labels = np.zeros((h, w), dtype=np.int32)
+    boxes, cur = [], 0
+    ys, xs = np.nonzero(mask)
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        if labels[y, x]:
+            continue
+        cur += 1
+        stack = [(y, x)]; labels[y, x] = cur
+        bx0 = bx1 = x; by0 = by1 = y; n = 0
+        while stack:
+            cy, cx = stack.pop(); n += 1
+            bx0, bx1, by0, by1 = min(bx0, cx), max(bx1, cx), min(by0, cy), max(by1, cy)
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not labels[ny, nx]:
+                    labels[ny, nx] = cur; stack.append((ny, nx))
+        boxes.append((bx0, by0, bx1 + 1, by1 + 1, n))
+    return labels, boxes
+
+
+def _erase_ink(img, rect, bg, keep_rules=True):
+    """Efface l'encre d'une zone en ne repeignant que les PIXELS D'ENCRE (couleur de fond locale), pas un rectangle plein :
+    la texture du papier reste et les FILETS (cadre de champ, ligne de tableau) qui traversent la zone sont conservés.
+    Sur un formulaire incliné de 1°, la bordure basse d'un champ entre dans la boîte OCR d'un côté : un rectangle plein
+    la coupait sur la moitié de sa longueur. Filet = composante fine (≤ 4 px ou 12 % de la hauteur) traversant ≥ 80 %
+    de la zone, ou longue (≥ 4 × son épaisseur) et sortant de la zone. Repli sur le rectangle plein si numpy manque."""
+    from PIL import Image, ImageDraw
+    x0, y0 = max(0, int(rect[0])), max(0, int(rect[1]))
+    x1, y1 = min(img.width, int(rect[2]) + 1), min(img.height, int(rect[3]) + 1)
+    if x1 <= x0 or y1 <= y0:
+        return
+    try:
+        import numpy as np
+        a = np.asarray(img.crop((x0, y0, x1, y1))).astype(int)
+        mask = np.abs(a - np.array(bg)).sum(axis=2) > 24
+        if keep_rules and mask.any():
+            labels, boxes = _label_components(mask)
+            h, w = mask.shape
+            thin = max(4, int(0.12 * h))
+            for k, (bx0, by0, bx1, by1, _n) in enumerate(boxes, 1):
+                cw, ch = bx1 - bx0, by1 - by0
+                touches = bx0 == 0 or by0 == 0 or bx1 == w or by1 == h
+                # filet horizontal : fin et soit traversant, soit long (≥ 4 × son épaisseur) et sortant de la zone —
+                # une bordure inclinée n'entre dans la boîte que sur une partie de sa longueur
+                horiz = ch <= thin and (cw >= 0.8 * w or (cw >= 4 * thin and touches))
+                vert = cw <= thin and (ch >= 0.8 * h or (ch >= 4 * thin and touches))
+                if horiz or vert:
+                    mask[labels == k] = False
+        d = mask.copy()                                   # dilatation 1 px : halos d'anticrénelage des glyphes
+        d[1:, :] |= mask[:-1, :]; d[:-1, :] |= mask[1:, :]; d[:, 1:] |= mask[:, :-1]; d[:, :-1] |= mask[:, 1:]
+        out = a.copy(); out[d] = np.array(bg)
+        img.paste(Image.fromarray(out.astype("uint8")), (x0, y0))
+    except Exception:
+        ImageDraw.Draw(img).rectangle([x0, y0, x1 - 1, y1 - 1], fill=bg)
+
+
+def _tighten_box(img, box, bg):
+    """Resserre la boîte OCR sur l'étendue verticale réelle de l'encre. Tesseract gonfle parfois une boîte de cellule
+    jusqu'au filet ou à la ligne voisine (« Bissig » h = 29 px dans un tableau à 16 px → corps 28 au lieu de 20) ; le corps
+    étant ajusté sur la hauteur, la cellule sortait 1,5 × trop grande. Les rangées de filet (≥ 60 % de pixels d'encre)
+    sont ignorées ; on ne fait que réduire, jamais agrandir."""
+    try:
+        import numpy as np
+        x0, y0, x1, y1 = box
+        a = np.asarray(img.crop((x0, y0, x1, y1))).astype(int)
+        ink = np.abs(a - np.array(bg)).sum(axis=2) > 40          # seuil bas : les sommets anticrénelés des « l » comptent
+        row = ink.sum(axis=1)
+        rows = np.nonzero((row >= 1) & (row < 0.6 * max(1, x1 - x0)))[0]
+        if len(rows) == 0:
+            return box
+        ny0, ny1 = y0 + int(rows[0]), y0 + int(rows[-1]) + 1
+        ext = ny1 - ny0
+        # garde-fous : un gonflement Tesseract reste < 2 × (étendue ≥ 45 % de la boîte) et l'encre d'un mot est continue
+        # (≥ 60 % des rangées de l'étendue en contiennent) — sur une page scannée au contraste faible, seules les rangées
+        # les plus sombres passaient le seuil et « WIDMER » tombait à 10 px
+        # ne resserrer qu'un gonflement net (≥ 20 % de la boîte) : sur du petit texte anticrénelé, rogner 1-2 rangées
+        # de sommets de lettres fausserait le corps plus que la boîte Tesseract elle-même
+        if ext < 4 or ext > 0.8 * (y1 - y0) or ext < 0.45 * (y1 - y0) or len(rows) < 0.6 * ext:
+            return box
+        return (x0, ny0, x1, ny1)
+    except Exception:
+        return box
+
+
+def _numeric_like(s):
+    return sum(ch.isalpha() for ch in s) <= 2
+
+
 def _paint_candidates(img, candidates, fonts, extra_tag=None, words=None):
-    """Recouvre chaque candidat (couleur de fond locale) et écrit le pseudonyme en respectant la typographie de l'image.
-    1. Hauteur de boîte corrigée de l'inclinaison (boîte − largeur × |pente|) : la même hauteur pour un nom court et un
-       numéro long sur la même carte. 2. Corps ajusté pour que le texte ORIGINAL (avec ses jambages/accents) remplisse
-       cette hauteur, puis homogénéisé par grappes sur toute l'image (_size_clusters) : un style = un corps.
-    3. Famille (sans / gras / mono / serif / condensé) choisie PAR GRAPPE (erreur de largeur cumulée de l'original), jamais
-       mot par mot : plus de mélange serif/gras sur une ligne. Retourne (boîtes, log)."""
+    """Recouvre chaque candidat et écrit le pseudonyme en respectant la typographie de l'image.
+    1. Hauteur de boîte corrigée de l'inclinaison (boîte − largeur × |pente|). 2. Corps : le texte ORIGINAL doit remplir
+       cette hauteur ; le corps retenu est la MÉDIANE du « run » (mots OCR fiables reliés au candidat par des espaces
+       simples sur la même ligne) — une ligne est une unité de style, et « Eduard » sans jambage ne sort plus plus petit
+       que « Weber » à côté. 3. Grappes de corps sur l'image (_size_clusters) : un style = un corps ; une grappe
+       PUREMENT NUMÉRIQUE 10-35 % au-dessus d'une grappe de mots est ramenée à celle-ci (des chiffres ne dépassent pas
+       les ascendantes du même style : l'écart vient des polices cursives/décoratives ou des boîtes OCR des chiffres).
+    4. Famille (sans / gras / mono / serif / condensé) choisie PAR GRAPPE. 5. Mots voisins remplacés sur une ligne
+       (écart ≤ 0,8 × hauteur = espace simple, pas une gouttière de tableau) : le suivant est REFOULÉ à la fin du
+       précédent + l'espace d'origine (plus de « Rémy    Kunz ») ; la ponctuation collée au mot OCR (« Weber, ») est
+       conservée. 6. Effacement par pixels d'encre (_erase_ink) : filets et texture conservés. Retourne (boîtes, log)."""
     from PIL import ImageDraw, ImageFont
     draw = ImageDraw.Draw(img)
     log, done_boxes = [], []
     slope = _image_slope(img)
+    trusted = [w for w in (words or []) if w["conf"] >= 75 and len(w["text"]) >= 2]
 
     def overlaps(b, d):
         ix = max(0, min(b[2], d[2]) - max(b[0], d[0])); iy = max(0, min(b[3], d[3]) - max(b[1], d[1]))
         return ix * iy > 0.5 * (b[2] - b[0]) * (b[3] - b[1])
 
-    # passe 1 : géométrie corrigée et ajustement par famille pour chaque candidat retenu
+    def vover(b, y0, y1):
+        iy = min(b[3], y1) - max(b[1], y0)
+        return iy / max(1, min(b[3] - b[1], y1 - y0))
+
+    def hc_of(w, h):
+        return max(4.0, h - min(w * slope, 0.5 * h))
+
+    def run_words(box):
+        """Mots fiables de la même ligne visuelle, reliés à la boîte par des écarts ≤ 1,2 × hauteur (espaces simples) ;
+        un libellé séparé de sa valeur par un blanc de colonne n'en fait pas partie. Sans les mots du candidat lui-même."""
+        x0, y0, x1, y1 = box
+        gap = max(12, 1.2 * (y1 - y0))
+        same = [w for w in trusted if vover(box, w["y"], w["y"] + w["h"]) >= 0.6]
+        lo, hi, run, rest = x0, x1, [], same
+        while True:
+            keep, added = [], False
+            for w in rest:
+                wx0, wx1 = w["x"], w["x"] + w["w"]
+                if wx1 >= lo - gap and wx0 <= hi + gap:
+                    run.append(w); lo, hi = min(lo, wx0), max(hi, wx1); added = True
+                else:
+                    keep.append(w)
+            rest = keep
+            if not added:
+                break
+        return [w for w in run if not (w["x"] + w["w"] > x0 + 2 and w["x"] < x1 - 2)]
+
+    # passe 1 : géométrie corrigée, ajustement par famille, couleurs (AVANT tout effacement)
     items = []
     for box, dtype, v, rep, how, conf_min in candidates:
         if any(overlaps(box, d) for d in done_boxes):
             continue   # déjà traité par une autre passe OCR
         done_boxes.append(box)
         x0, y0, x1, y1 = box
+        pad = 3
+        border = [img.getpixel((min(max(x, 0), img.width - 1), min(max(y, 0), img.height - 1)))
+                  for x in range(x0 - pad, x1 + pad, 4) for y in (y0 - pad, y1 + pad)]
+        bg = tuple(sorted(c[k] for c in border)[len(border) // 2] for k in range(3)) if border else (255, 255, 255)
+        ocr_box = box
+        box = _tighten_box(img, box, bg)                          # boîte gonflée par Tesseract → étendue de l'encre
+        x0, y0, x1, y1 = box
         infl = min((x1 - x0) * slope, 0.5 * (y1 - y0))          # gonflement dû à l'inclinaison, réparti haut/bas
         hc = max(4.0, (y1 - y0) - infl)
         fits = {fam: _fit_font(draw, ImageFont, path, v, x1 - x0, hc) for fam, path in fonts.items()}
-        items.append({"box": box, "dtype": dtype, "v": v, "rep": rep, "how": how, "conf": conf_min,
-                      "infl": infl, "fits": fits})
+        inner = [img.getpixel((x, y)) for x in range(x0, x1, 3) for y in range(y0, y1, 2)]
+        ink = min(inner, key=sum) if inner else (15, 15, 15)
+        if sum(bg) - sum(ink) < 90:          # contraste trop faible (fond sombre) : encre par défaut lisible
+            ink = (255, 255, 255) if sum(bg) < 384 else (15, 15, 15)
+        items.append({"box": box, "ocr_box": ocr_box, "dtype": dtype, "v": v, "rep": rep, "how": how, "conf": conf_min,
+                      "infl": infl, "hc": hc, "fits": fits, "bg": bg, "ink": ink, "run": run_words(box)})
     if not items:
         return done_boxes, log
+
     def pick_family(idx, base):
         # une famille ne supplante la famille de base que si elle réduit l'erreur de largeur cumulée de ≥ 25 % :
         # DejaVu Sans et Serif ont des chasses quasi identiques, la largeur seule les départage au hasard
@@ -486,52 +623,117 @@ def _paint_candidates(img, candidates, fonts, extra_tag=None, words=None):
         best = min(errs, key=errs.get)
         return best if base not in errs or errs[best] < 0.75 * errs[base] else base
     ref_fam = pick_family(range(len(items)), "sans")          # famille de référence de l'image
-    clusters = _size_clusters([it["fits"][ref_fam][0].size for it in items])
+    # corps de référence par candidat : médiane du run (le candidat + ses voisins de ligne)
+    for it in items:
+        sizes = [it["fits"][ref_fam][0].size]
+        for w in it["run"]:
+            sizes.append(_fit_font(draw, ImageFont, fonts[ref_fam], w["text"], w["w"], hc_of(w["w"], w["h"]))[0].size)
+        it["ref_size"] = sorted(sizes)[len(sizes) // 2]
+    clusters = _size_clusters([it["ref_size"] for it in items])
+    letter_cl = {c for i, c in clusters.items() if not _numeric_like(items[i]["v"])}
+    for i, c in list(clusters.items()):
+        if c not in letter_cl:
+            below = [l for l in letter_cl if l < c <= 1.35 * l]
+            if below:
+                clusters[i] = max(below)
     # famille par grappe de corps (un style = une famille), la référence de l'image sauf écart net
     fam_of = {}
     for cl in set(clusters.values()):
         fam_of[cl] = pick_family([i for i, c in clusters.items() if c == cl], ref_fam)
-
     for i, it in enumerate(items):
-        x0, y0, x1, y1 = it["box"]; v, rep = it["v"], it["rep"]
         fam = fam_of[clusters[i]]
-        size = max(6, int(round(clusters[i] * it["fits"][fam][0].size / max(it["fits"][ref_fam][0].size, 1))))
-        font = ImageFont.truetype(fonts[fam], size)
-        top = font.getbbox(v)[1]                            # décalage haut du rendu de l'ORIGINAL → même ligne de base
-        ty0, ty1 = int(y0 + it["infl"] / 2), int(y1 - it["infl"] / 2)   # boîte typographique (sans le gonflement)
-        # couleur de fond : médiane d'une bordure autour de la boîte ; couleur d'encre : pixel le plus sombre
-        pad = 3
-        border = [img.getpixel((min(max(x, 0), img.width - 1), min(max(y, 0), img.height - 1)))
-                  for x in range(x0 - pad, x1 + pad, 4) for y in (y0 - pad, y1 + pad)]
-        bg = tuple(sorted(c[k] for c in border)[len(border) // 2] for k in range(3)) if border else (255, 255, 255)
-        inner = [img.getpixel((x, y)) for x in range(x0, x1, 3) for y in range(y0, y1, 2)]
-        ink = min(inner, key=sum) if inner else (15, 15, 15)
-        if sum(bg) - sum(ink) < 90:          # contraste trop faible (fond sombre) : encre par défaut lisible
-            ink = (255, 255, 255) if sum(bg) < 384 else (15, 15, 15)
-        r = rep.upper() if (v.isupper() and it["dtype"] in ("FIRST_NAME", "LAST_NAME")) else rep
+        it["fam"] = fam
+        it["size"] = max(6, int(round(clusters[i] * it["fits"][fam][0].size / max(it["fits"][ref_fam][0].size, 1))))
+        it["r"] = it["rep"].upper() if (it["v"].isupper() and it["dtype"] in ("FIRST_NAME", "LAST_NAME")) else it["rep"]
+        # « Weber, » : la virgule appartient au mot OCR, pas à la valeur → la garder après le pseudonyme
+        bx = it["box"]
+        for w in trusted:
+            if abs(w["x"] + w["w"] - bx[2]) <= 3 and vover(bx, w["y"], w["y"] + w["h"]) >= 0.6 and w["text"][-1] in ",;:." \
+                    and not it["v"].endswith(w["text"][-1]) and not it["r"].endswith(w["text"][-1]):
+                it["r"] += w["text"][-1]; break
 
-        def is_bg(px):
-            return sum(abs(px[k] - bg[k]) for k in range(3)) < 45
-        free = x1 + pad
-        while free < img.width - 1 and free - x1 < max((x1 - x0) * 0.8 + 40, (x1 - x0) * 1.5):
-            if all(is_bg(img.getpixel((free, yy))) for yy in range(ty0, max(ty0 + 1, ty1), max(1, (ty1 - ty0) // 4))):
-                free += 2
+    # lignes visuelles (recouvrement vertical ≥ 60 %), triées de gauche à droite
+    groups = []
+    for i in sorted(range(len(items)), key=lambda i: (items[i]["box"][1] + items[i]["box"][3], items[i]["box"][0])):
+        b = items[i]["box"]
+        for g in groups:
+            gb = items[g[-1]]["box"]
+            if vover(gb, b[1], b[3]) >= 0.6:
+                g.append(i); break
+        else:
+            groups.append([i])
+    pad = 3
+    for g in groups:
+        g.sort(key=lambda i: items[i]["box"][0])
+        # 1) effacer toutes les boîtes d'origine de la ligne (avant d'écrire : un pseudonyme long peut déborder sur la
+        #    boîte du voisin, qui serait effacé après coup)
+        for i in g:
+            x0, y0, x1, y1 = items[i]["ocr_box"]                 # toute la boîte lue par l'OCR, pas la boîte resserrée
+            _erase_ink(img, (x0 - pad, y0 - pad, x1 + pad, y1 + pad), items[i]["bg"])
+        # 2) chaînes : mots reliés par un espace simple (≤ 0,8 × hauteur, rien d'autre entre eux). Une chaîne est
+        #    mise en page comme une unité : refoulée mot à mot et, si elle ne tient pas dans l'espace libre, réduite
+        #    d'un même facteur (sinon le dernier mot seul encaissait toute la réduction : « Amrein » minuscule)
+        chains, cur = [], [g[0]]
+        for a_, b_ in zip(g, g[1:]):
+            gap = items[b_]["box"][0] - items[a_]["box"][2]
+            bb = items[b_]["box"]
+            between = any(w["x"] >= items[a_]["box"][2] - 2 and w["x"] + w["w"] <= bb[0] + 2
+                          and vover(bb, w["y"], w["y"] + w["h"]) >= 0.6 for w in trusted)
+            if 0 <= gap <= max(10, 0.8 * items[b_]["hc"]) and not between:
+                cur.append(b_)
             else:
-                break
-        avail = max(x1 - x0, free - pad - x0)
-        while size > 6 and draw.textlength(r, font=font) > avail:
-            size -= 1; font = ImageFont.truetype(fonts[fam], size)
-        xr = x0 + int(draw.textlength(r, font=font)) + pad
-        draw.rectangle([x0 - pad, y0 - pad, max(x1, xr) + pad, y1 + pad], fill=bg)
-        done_boxes[done_boxes.index(it["box"])] = (x0 - pad, y0 - pad, max(x1, xr) + pad, y1 + pad)
-        draw.text((x0, ty0 - top), r, font=font, fill=ink)
-        entry = {"type": it["dtype"], "original": v, "replacement": r, "box": it["box"], "font": fam, "font_px": font.size,
-                 "skew": round(slope, 4), "match": it["how"], "ocr_conf_min": it["conf"]}
-        if extra_tag:
-            entry["tag"] = extra_tag
-        log.append(entry)
-    return done_boxes, log
+                chains.append(cur); cur = [b_]
+        chains.append(cur)
+        for ch in chains:
+            first, last = items[ch[0]], items[ch[-1]]
+            lx0, ly0, lx1, ly1 = last["box"]; bg = last["bg"]
+            lty0, lty1 = int(ly0 + last["infl"] / 2), int(ly1 - last["infl"] / 2)
 
+            def is_bg(px):
+                return sum(abs(px[k] - bg[k]) for k in range(3)) < 45
+            free = lx1 + pad
+            while free < img.width - 1 and free - lx1 < max((lx1 - lx0) * 0.8 + 40, (lx1 - lx0) * 1.5):
+                if all(is_bg(img.getpixel((free, yy))) for yy in range(lty0, max(lty0 + 1, lty1), max(1, (lty1 - lty0) // 4))):
+                    free += 2
+                else:
+                    break
+            avail = max(lx1, free - pad) - first["box"][0]
+            gaps = [items[b_]["box"][0] - items[a_]["box"][2] for a_, b_ in zip(ch, ch[1:])]
+
+            def needed(f):
+                tot = sum(gaps)
+                for i in ch:
+                    fnt = ImageFont.truetype(fonts[items[i]["fam"]], max(6, int(items[i]["size"] * f)))
+                    tot += draw.textlength(items[i]["r"], font=fnt)
+                return tot
+            f = 1.0
+            while f > 0.3 and needed(f) > avail:
+                f -= 0.05
+            xd = first["box"][0]
+            for k, i in enumerate(ch):
+                it = items[i]; x0, y0, x1, y1 = it["box"]; fam, v, r = it["fam"], it["v"], it["r"]
+                size = max(6, int(it["size"] * f)); font = ImageFont.truetype(fonts[fam], size)
+                ty0 = int(y0 + it["infl"] / 2)
+                top = font.getbbox(v)[1]                        # décalage haut du rendu de l'ORIGINAL → même ligne de base
+                xr = xd + int(draw.textlength(r, font=font))
+                if xr > x1:                                     # le pseudonyme dépasse la boîte : effacer aussi la suite
+                    _erase_ink(img, (x1 + pad, y0 - pad, xr + pad, y1 + pad), it["bg"])
+                draw.text((xd, ty0 - top), r, font=font, fill=it["ink"])
+                nb = (min(x0, xd) - pad, y0 - pad, max(x1, xr) + pad, y1 + pad)
+                done_boxes[done_boxes.index(it["ocr_box"])] = nb
+                entry = {"type": it["dtype"], "original": v, "replacement": r, "box": it["ocr_box"], "font": fam,
+                         "font_px": font.size, "skew": round(slope, 4), "match": it["how"], "ocr_conf_min": it["conf"]}
+                if it["box"] != it["ocr_box"]:
+                    entry["tightened_box"] = it["box"]
+                if xd != x0:
+                    entry["x_shift"] = xd - x0
+                if f < 1.0:
+                    entry["chain_scale"] = round(f, 2)
+                if extra_tag:
+                    entry["tag"] = extra_tag
+                log.append(entry)
+                xd = xr + (gaps[k] if k < len(gaps) else 0)
+    return done_boxes, log
 
 
 def sanitize_image_bytes(data, ext, pz: Pseudonymizer, strict=False, ocr_scale=None,
@@ -595,26 +797,8 @@ def _ink_mask(img):
 
 def _components(mask, step=2):
     """Composantes connexes (4-voisinage) sur une image réduite d'un facteur `step` : [(x0, y0, x1, y1, n_pixels)]."""
-    import numpy as np
-    small = mask[::step, ::step]
-    sh, sw = small.shape
-    labels = np.zeros((sh, sw), dtype=np.int32)
-    boxes, cur = [], 0
-    ys, xs = np.nonzero(small)
-    for y, x in zip(ys, xs):
-        if labels[y, x]:
-            continue
-        cur += 1
-        stack = [(y, x)]; labels[y, x] = cur
-        bx0 = bx1 = x; by0 = by1 = y; n = 0
-        while stack:
-            cy, cx = stack.pop(); n += 1
-            bx0, bx1, by0, by1 = min(bx0, cx), max(bx1, cx), min(by0, cy), max(by1, cy)
-            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
-                if 0 <= ny < sh and 0 <= nx < sw and small[ny, nx] and not labels[ny, nx]:
-                    labels[ny, nx] = cur; stack.append((ny, nx))
-        boxes.append((bx0 * step, by0 * step, (bx1 + 1) * step, (by1 + 1) * step, n * step * step))
-    return boxes
+    _labels, boxes = _label_components(mask[::step, ::step])
+    return [(bx0 * step, by0 * step, bx1 * step, by1 * step, n * step * step) for bx0, by0, bx1, by1, n in boxes]
 
 
 def _trusted_words(words):
@@ -1507,6 +1691,115 @@ def sanitize_scanned_page(page, doc, pz, strict, dpi=SCAN_DPI):
     return info, log
 
 
+def _pdf_spans(page):
+    """Spans de texte de la page : (bbox, corps, ligne de base y, nom de police, flags, couleur RGB 0-1)."""
+    out = []
+    try:
+        for b in page.get_text("dict")["blocks"]:
+            for l in b.get("lines", []):
+                for sp in l.get("spans", []):
+                    c = sp.get("color", 0)
+                    rgb = (((c >> 16) & 255) / 255.0, ((c >> 8) & 255) / 255.0, (c & 255) / 255.0)
+                    out.append((sp["bbox"], sp["size"], sp["origin"][1], sp.get("font", ""), sp.get("flags", 0), rgb))
+    except Exception:
+        pass
+    return out
+
+
+def _pdf_base14(fontname, flags):
+    """Police de base 14 la plus proche du span d'origine (les polices du PDF ne sont pas forcément réutilisables)."""
+    name = (fontname or "").lower()
+    bold = bool(flags & 16) or "bold" in name or "black" in name or "heavy" in name
+    if flags & 8 or "mono" in name or "courier" in name:
+        return "cobo" if bold else "cour"
+    if flags & 2 or "times" in name or "serif" in name or "georgia" in name or "garamond" in name:
+        return "tibo" if bold else "tiro"
+    return "hebo" if bold else "helv"
+
+
+def _pdf_reinsert(page, rects, words, spans, fitz):
+    """Réécrit les pseudonymes dans les zones caviardées en respectant la typographie de la page :
+    corps, ligne de base, police (base 14 la plus proche) et couleur du SPAN d'origine — plus de texte posé 1-2 pt trop
+    haut ni de corps 0,78 × hauteur de boîte. Espace disponible = jusqu'au mot suivant de la ligne (ou la marge) : un
+    pseudonyme plus long que l'original garde son corps tant qu'il y a du blanc à droite (« 5. November 1962 » sortait
+    en exposant). Mots voisins remplacés (espace simple, rien entre eux) = une chaîne refoulée mot à mot et réduite d'un
+    même facteur si elle ne tient pas (« KELLERFranz »). Retourne les entrées de log."""
+    items = []
+    for r, v, dtype, rep in rects:
+        if not rep:
+            continue        # 2e ligne d'une valeur coupée : la zone est effacée, rien à réécrire
+        rr = rep.upper() if (v.isupper() and dtype in ("FIRST_NAME", "LAST_NAME")) else rep
+        best, bo = None, 0.0
+        for bbox, size, base, fname, flags, rgb in spans:
+            iy = min(r.y1, bbox[3]) - max(r.y0, bbox[1]); ix = min(r.x1, bbox[2]) - max(r.x0, bbox[0])
+            if iy > 0.5 * min(r.height, bbox[3] - bbox[1]) and ix > 0 and ix * iy > bo:
+                best, bo = (size, base, fname, flags, rgb), ix * iy
+        if best:
+            size, base, fname, flags, rgb = best
+            fn = _pdf_base14(fname, flags)
+        else:
+            size, base, fn, rgb = max(5.0, r.height * 0.78), r.y1 - 0.22 * r.height, "helv", (0, 0, 0)
+        items.append({"r": r, "v": v, "dtype": dtype, "rr": rr, "size": float(size), "base": base, "fn": fn, "rgb": rgb})
+    if not items:
+        return []
+    log = []
+
+    def vover(a, b):
+        iy = min(a.y1, b.y1) - max(a.y0, b.y0)
+        return iy / max(0.1, min(a.height, b.height))
+    # lignes visuelles puis chaînes (écart ≤ 0,6 corps ≈ deux espaces, aucun mot non remplacé entre les deux)
+    groups = []
+    for i in sorted(range(len(items)), key=lambda i: (items[i]["r"].y0 + items[i]["r"].y1, items[i]["r"].x0)):
+        for g in groups:
+            if vover(items[g[-1]]["r"], items[i]["r"]) >= 0.6:
+                g.append(i); break
+        else:
+            groups.append([i])
+    replaced = [it["r"] for it in items]
+
+    def is_replaced(w):
+        wr = fitz.Rect(w[:4])
+        return any(wr.intersects(r) and (wr & r).width > 0.5 * wr.width for r in replaced)
+    for g in groups:
+        g.sort(key=lambda i: items[i]["r"].x0)
+        chains, cur = [], [g[0]]
+        for a, b in zip(g, g[1:]):
+            ra, rb = items[a]["r"], items[b]["r"]; gap = rb.x0 - ra.x1
+            between = any(w[0] >= ra.x1 - 0.5 and w[2] <= rb.x0 + 0.5 and vover(fitz.Rect(w[:4]), rb) >= 0.6
+                          and not is_replaced(w) for w in words)
+            if -0.5 <= gap <= 0.6 * items[b]["size"] and not between:
+                cur.append(b)
+            else:
+                chains.append(cur); cur = [b]
+        chains.append(cur)
+        for ch in chains:
+            first, last = items[ch[0]], items[ch[-1]]
+            nxt = [w[0] for w in words if w[0] >= last["r"].x1 - 0.5 and vover(fitz.Rect(w[:4]), last["r"]) >= 0.5
+                   and not is_replaced(w)]
+            limit = (min(nxt) - 0.25 * last["size"]) if nxt else (page.rect.x1 - 12)
+            avail = max(last["r"].x1, limit) - first["r"].x0
+            gaps = [max(0.0, items[b]["r"].x0 - items[a]["r"].x1) for a, b in zip(ch, ch[1:])]
+
+            def needed(f):
+                return sum(gaps) + sum(fitz.get_text_length(items[i]["rr"], fontname=items[i]["fn"],
+                                                            fontsize=max(4.0, items[i]["size"] * f)) for i in ch)
+            f = 1.0
+            while f > 0.3 and needed(f) > avail:
+                f -= 0.025
+            x = first["r"].x0
+            for k, i in enumerate(ch):
+                it = items[i]; fs = max(4.0, round(it["size"] * f, 2))
+                page.insert_text((x, it["base"]), it["rr"], fontsize=fs, fontname=it["fn"], color=it["rgb"])
+                e = {"type": it["dtype"], "original": it["v"], "replacement": it["rr"], "fontsize": fs, "font": it["fn"]}
+                if abs(x - it["r"].x0) > 0.5:
+                    e["x_shift"] = round(x - it["r"].x0, 1)
+                if f < 1.0:
+                    e["chain_scale"] = round(f, 3)
+                log.append(e)
+                x += fitz.get_text_length(it["rr"], fontname=it["fn"], fontsize=fs) + (gaps[k] if k < len(gaps) else 0)
+    return log
+
+
 def sanitize_pdf(src, dst, pz, strict):
     try:
         import fitz  # PyMuPDF
@@ -1541,16 +1834,11 @@ def sanitize_pdf(src, dst, pz, strict):
         for r, v, dtype, rep in rects:
             page.add_redact_annot(r, fill=(1, 1, 1))
         if rects:
+            spans_before = _pdf_spans(page)                    # métriques d'origine : lues AVANT la caviardage
             page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-            for r, v, dtype, rep in rects:
-                if not rep:
-                    continue        # 2e ligne d'une valeur coupée : la zone est effacée, rien à réécrire
-                rr = rep.upper() if (v.isupper() and dtype in ("FIRST_NAME", "LAST_NAME")) else rep
-                fs = max(5.0, r.height * 0.78)
-                box = fitz.Rect(r.x0, r.y0 - 1, r.x1 + 2, r.y1 + 1)
-                while fs > 4 and page.insert_textbox(box, rr, fontsize=fs, fontname="helv", color=(0, 0, 0)) < 0:
-                    fs -= 0.5
-                log.append({"page": page.number + 1, "type": dtype, "original": v, "replacement": rr})
+            for e in _pdf_reinsert(page, rects, words_on_page, spans_before, fitz):
+                e["page"] = page.number + 1
+                log.append(e)
         # signatures vectorielles (tracés courbes), annotations /Ink, champs /Sig -> recouvrement (COVER_SIGNATURES)
         if os.environ.get("COVER_SIGNATURES", "1") == "1":
             try:
