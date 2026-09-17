@@ -1860,33 +1860,50 @@ def _pdf_reinsert(page, rects, words, spans, fitz):
                    and not is_replaced(w)]
             limit = (min(nxt) - 0.25 * last["size"]) if nxt else (page.rect.x1 - 12)
             avail = max(last["r"].x1, limit) - first["r"].x0
-            gaps = [max(0.0, items[b]["r"].x0 - items[a]["r"].x1) for a, b in zip(ch, ch[1:])]
+            # segments : mots voisins de MÊME style (police, corps, ligne de base, couleur) fusionnés en une seule
+            # chaîne avec de vrais caractères espace — deux objets texte séparés de 2,9 pt sont recollés par les
+            # extracteurs à tolérance (pdfplumber : « FranzKeller ») ; un espace explicite les sépare pour tout le monde
+            segs = []
+            for i in ch:
+                it = items[i]
+                if segs and all(items[segs[-1][-1]][k] == it[k] for k in ("fn", "ff", "rgb")) \
+                        and abs(items[segs[-1][-1]]["size"] - it["size"]) < 0.1 and abs(items[segs[-1][-1]]["base"] - it["base"]) < 0.3:
+                    segs[-1].append(i)
+                else:
+                    segs.append([i])
+            seg_txt = [" ".join(items[i]["rr"] for i in sg) for sg in segs]
+            seg_gap = [max(0.0, items[b[0]]["r"].x0 - items[a[-1]]["r"].x1) for a, b in zip(segs, segs[1:])]
 
-            def tlen(it, fs):
+            def tlen(it, fs, txt=None):
+                txt = it["rr"] if txt is None else txt
                 if it["ff"]:
-                    return fitz.Font(fontfile=it["ff"]).text_length(it["rr"], fontsize=fs)
-                return fitz.get_text_length(it["rr"], fontname=it["fn"], fontsize=fs)
+                    return fitz.Font(fontfile=it["ff"]).text_length(txt, fontsize=fs)
+                return fitz.get_text_length(txt, fontname=it["fn"], fontsize=fs)
 
             def needed(f):
-                return sum(gaps) + sum(tlen(items[i], max(4.0, items[i]["size"] * f)) for i in ch)
+                return sum(seg_gap) + sum(tlen(items[sg[0]], max(4.0, items[sg[0]]["size"] * f), txt)
+                                          for sg, txt in zip(segs, seg_txt))
             f = 1.0
             while f > 0.3 and needed(f) > avail:
                 f -= 0.025
             x = first["r"].x0
-            for k, i in enumerate(ch):
-                it = items[i]; fs = max(4.0, round(it["size"] * f, 2))
+            for k, (sg, txt) in enumerate(zip(segs, seg_txt)):
+                it = items[sg[0]]; fs = max(4.0, round(it["size"] * f, 2))
                 if it["ff"]:
-                    page.insert_text((x, it["base"]), it["rr"], fontsize=fs, fontname=it["fn"], fontfile=it["ff"], color=it["rgb"])
+                    page.insert_text((x, it["base"]), txt, fontsize=fs, fontname=it["fn"], fontfile=it["ff"], color=it["rgb"])
                 else:
-                    page.insert_text((x, it["base"]), it["rr"], fontsize=fs, fontname=it["fn"], color=it["rgb"])
-                e = {"type": it["dtype"], "original": it["v"], "replacement": it["rr"], "fontsize": fs,
-                     "font": os.path.basename(it["ff"]) if it["ff"] else it["fn"], "source_font": it["src_font"]}
-                if abs(x - it["r"].x0) > 0.5:
-                    e["x_shift"] = round(x - it["r"].x0, 1)
-                if f < 1.0:
-                    e["chain_scale"] = round(f, 3)
-                log.append(e)
-                x += tlen(it, fs) + (gaps[k] if k < len(gaps) else 0)
+                    page.insert_text((x, it["base"]), txt, fontsize=fs, fontname=it["fn"], color=it["rgb"])
+                for j, i in enumerate(sg):
+                    e = {"type": items[i]["dtype"], "original": items[i]["v"], "replacement": items[i]["rr"], "fontsize": fs,
+                         "font": os.path.basename(it["ff"]) if it["ff"] else it["fn"], "source_font": items[i]["src_font"]}
+                    if j == 0 and abs(x - it["r"].x0) > 0.5:
+                        e["x_shift"] = round(x - it["r"].x0, 1)
+                    if j > 0:
+                        e["joined"] = True
+                    if f < 1.0:
+                        e["chain_scale"] = round(f, 3)
+                    log.append(e)
+                x += tlen(it, fs, txt) + (seg_gap[k] if k < len(seg_gap) else 0)
     return log
 
 
@@ -1921,7 +1938,16 @@ def sanitize_pdf(src, dst, pz, strict):
         for v, (dtype, rep) in uniq.items():
             for r in page.search_for(v):
                 rects.append((r, v, dtype, rep))
-        for r, v, dtype, rep in rects:
+        # caviardage : fusionner les rectangles voisins d'une même ligne (écart ≤ 0,6 × hauteur) pour effacer aussi le
+        # glyphe ESPACE d'origine entre deux mots remplacés — sinon il reste au milieu du pseudonyme réécrit et les
+        # extracteurs à tolérance (pdfplumber, pdfminer) lisent « Vincent Bi se » ; PyMuPDF, lui, ne le voyait pas
+        red = []
+        for r, v, dtype, rep in sorted(rects, key=lambda t: (round(t[0].y0), t[0].x0)):
+            if red and abs(red[-1].y0 - r.y0) < 0.5 * r.height and -0.5 <= r.x0 - red[-1].x1 <= 0.6 * r.height:
+                red[-1] = red[-1] | r
+            else:
+                red.append(fitz.Rect(r))
+        for r in red:
             page.add_redact_annot(r, fill=(1, 1, 1))
         if rects:
             spans_before = _pdf_spans(page)                    # métriques d'origine : lues AVANT la caviardage
@@ -1972,10 +1998,11 @@ def sanitize_pdf(src, dst, pz, strict):
                             desc=info.get("desc") or "")
         else:
             review.append({"type": e.get("type", "EMBEDDED_UNSUPPORTED"), "object": fname, "reason": e.get("reason")})
-    try:
-        doc.subset_fonts()          # polices TTF réinsérées (DejaVu) réduites aux glyphes utilisés : 2,6 Mo -> 1,7 Mo
-    except Exception:
-        pass
+    if os.environ.get("PDF_SUBSET_FONTS", "1") == "1":
+        try:
+            doc.subset_fonts()      # polices TTF réinsérées (DejaVu) réduites aux glyphes utilisés : 2,6 Mo -> 1,7 Mo
+        except Exception:
+            pass
     doc.save(dst, garbage=4, clean=True, deflate=True)
     res = {"text_replacements": log, "images": img_log, "pages": pages_log}
     if emb_log:
