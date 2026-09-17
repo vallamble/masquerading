@@ -835,9 +835,13 @@ def sanitize_image_bytes(data, ext, pz: Pseudonymizer, strict=False, ocr_scale=N
         log += unread
     except Exception as exc:   # numpy absent, etc. : ne jamais bloquer la sanitization
         log.append({"type": "UNREAD_INK", "match": "score_failed", "error": str(exc)})
-    buf = io.BytesIO()
-    fmt = "JPEG" if ext.lower() in (".jpg", ".jpeg") else "PNG"
-    img.save(buf, fmt, quality=92) if fmt == "JPEG" else img.save(buf, fmt)
+    if ext.lower() in (".jpg", ".jpeg"):
+        out, q = _jpeg_fit(img, len(data))          # qualité la plus haute (≤ 92) qui ne dépasse pas l'original
+        log.append({"type": "ENCODE", "match": "jpeg_quality", "quality": q, "in": len(data), "out": len(out)})
+        return out, log
+    buf = io.BytesIO(); img.save(buf, "PNG")
+    if len(buf.getvalue()) > len(data):
+        buf = io.BytesIO(); img.save(buf, "PNG", compress_level=9)
     return buf.getvalue(), log
 
 
@@ -1713,12 +1717,11 @@ def sanitize_scanned_page(page, doc, pz, strict, dpi=SCAN_DPI):
             src = [(0, 0), (1000, 0), (0, 1000)]
             T = _affine_from_points(src, [d2raw(*q) for q in src])
             _transfer_patches(painted, raw, boxes, T)
-            buf = io.BytesIO()
             if raw_info["ext"].lower() in ("jpeg", "jpg"):
-                raw.save(buf, "JPEG", quality=80)
+                data_out, _q = _jpeg_fit(raw, len(raw_info["image"]), q_start=88)   # ≤ taille du flux d'origine
             else:
-                raw.save(buf, "PNG")
-            page.replace_image(xref, stream=buf.getvalue())
+                buf = io.BytesIO(); raw.save(buf, "PNG"); data_out = buf.getvalue()
+            page.replace_image(xref, stream=data_out)
         else:
             # pas de XObject : le rendu masqué (ramené à la géométrie du rendu) devient la page
             back = painted.rotate(-skew, resample=Image.BICUBIC, fillcolor=(255, 255, 255))
@@ -1765,32 +1768,51 @@ def _pdf_spans(page):
     return out
 
 
-_TTF_DIRS = ["/usr/share/fonts/truetype/dejavu"] + list(_LO_FONTS)
+_TTF_DIRS = ["/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/truetype/liberation", "/usr/share/fonts/truetype/liberation2",
+             "/usr/share/fonts/truetype/crosextra"] + list(_LO_FONTS)
+# familles clientes → fichiers TrueType (équivalents métriques libres : mêmes chasses, donc même mise en page) ;
+# (motif de nom, base de fichier, style régulier/gras/italique/gras-italique)
+_TTF_FAMILIES = [
+    (("arial", "arialmt", "liberationsans", "liberation sans"), "LiberationSans", ("-Regular", "-Bold", "-Italic", "-BoldItalic")),
+    (("times new roman", "timesnewroman", "liberationserif", "liberation serif"), "LiberationSerif", ("-Regular", "-Bold", "-Italic", "-BoldItalic")),
+    (("courier new", "couriernew", "liberationmono", "liberation mono"), "LiberationMono", ("-Regular", "-Bold", "-Italic", "-BoldItalic")),
+    (("calibri", "carlito"), "Carlito", ("-Regular", "-Bold", "-Italic", "-BoldItalic")),
+    (("cambria", "caladea"), "Caladea", ("-Regular", "-Bold", "-Italic", "-BoldItalic")),
+    (("dejavusansmono", "dejavu sans mono"), "DejaVuSansMono", ("", "-Bold", "-Oblique", "-BoldOblique")),
+    (("dejavuserif", "dejavu serif"), "DejaVuSerif", ("", "-Bold", "-Italic", "-BoldItalic")),
+    (("dejavusans", "dejavu sans", "dejavu"), "DejaVuSans", ("", "-Bold", "-Oblique", "-BoldOblique")),
+]
+
+
+def _ttf_path(base, style):
+    for d in _TTF_DIRS:
+        path = os.path.join(os.path.expanduser(d), base + style + ".ttf")
+        if os.path.exists(path):
+            return path
+    return None
 
 
 def _pdf_font_for(fontname, flags):
     """(nom de police PyMuPDF, fichier TTF ou None) le plus fidèle au span d'origine.
     Flags PyMuPDF : 1 exposant, 2 italique, 4 « serifed » (peu fiable : DejaVuSans l'a), 8 monospace, 16 gras.
-    1) Une police DejaVu d'origine (Sans / Serif / Mono × Bold × Oblique/Italic) est réutilisée depuis le fichier TTF
-       présent dans le conteneur (fonts-dejavu) ou dans LibreOffice sur macOS : un « Keller » en Helvetica au milieu
-       d'une page en DejaVu Sans se voit tout de suite. 2) Sinon base 14 par nom puis flags (gras, italique, mono ;
-       serif par le NOM seulement)."""
+    1) La famille d'origine est réécrite avec un fichier TrueType de mêmes métriques (_TTF_FAMILIES) : DejaVu tel quel,
+       Arial → Liberation Sans, Times New Roman → Liberation Serif, Courier New → Liberation Mono, Calibri → Carlito,
+       Cambria → Caladea (fonts-liberation / crosextra dans le conteneur, LibreOffice sur macOS) — un « Keller » en
+       Helvetica au milieu d'une page en DejaVu Sans se voyait tout de suite. 2) Sinon base 14 par nom puis flags (gras,
+       italique, mono ; serif par le NOM seulement) — exact pour les Helvetica/Times/Courier non embarquées."""
     name = (fontname or "").lower()
     bold = bool(flags & 16) or any(k in name for k in ("bold", "black", "heavy", "semibold"))
     italic = bool(flags & 2) or any(k in name for k in ("italic", "oblique"))
     mono = bool(flags & 8) or any(k in name for k in ("mono", "courier", "consolas", "menlo"))
     serif = any(k in name for k in ("times", "serif", "georgia", "garamond", "cambria", "book")) and "sans" not in name
-    if "dejavu" in name:
-        fam = "DejaVuSansMono" if mono else ("DejaVuSerif" if "serif" in name else "DejaVuSans")
-        style = ("-Bold" if bold else "") + (("Italic" if fam == "DejaVuSerif" else "Oblique") if italic else "")
-        if bold and italic:
-            style = "-Bold" + ("Italic" if fam == "DejaVuSerif" else "Oblique")
-        elif italic:
-            style = "-" + ("Italic" if fam == "DejaVuSerif" else "Oblique")
-        for d in _TTF_DIRS:
-            path = os.path.join(os.path.expanduser(d), fam + style + ".ttf")
-            if os.path.exists(path):
+    base_name = name.split("+")[-1]                       # « ABCDEF+Arial-BoldMT » → « arial-boldmt »
+    for keys, base, styles in _TTF_FAMILIES:
+        if any(k in base_name for k in keys):
+            style = styles[3] if (bold and italic) else styles[1] if bold else styles[2] if italic else styles[0]
+            path = _ttf_path(base, style) or _ttf_path(base, styles[0])
+            if path:
                 return "F" + hashlib.md5(path.encode()).hexdigest()[:8], path
+            break
     if mono:
         return ("cobi" if bold and italic else "cobo" if bold else "coit" if italic else "cour"), None
     if serif:
@@ -2012,6 +2034,239 @@ def sanitize_pdf(src, dst, pz, strict):
     return res
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Taille de fichier identique à l'entrée (exigence 7 « maintaining the same file size »)
+# ---------------------------------------------------------------------------------------------------------------------
+def _jpeg_fit(img, target_len, q_start=92, q_min=55):
+    """Encode `img` en JPEG au meilleur niveau de qualité (≤ q_start) dont la taille ne dépasse pas `target_len` ;
+    à défaut, la plus petite (q_min). Retourne (octets, qualité)."""
+    best = None
+    for q in range(q_start, q_min - 1, -2):
+        buf = io.BytesIO(); img.save(buf, "JPEG", quality=q); data = buf.getvalue()
+        best = (data, q)
+        if target_len is None or len(data) <= target_len:
+            break
+    return best
+
+
+def _pad_pdf(dst, target):
+    """Ajuste la taille d'un PDF à `target` octets avec un objet flux non référencé (/MasqueradingPad true) rempli de
+    zéros, stocké sans compression pour être linéaire ; convergence en quelques sauvegardes (les offsets xref changent
+    de longueur en franchissant une puissance de 10). Retourne la méthode ou None si la sortie est déjà plus grosse."""
+    import fitz
+    for _ in range(8):
+        size = os.path.getsize(dst); d = target - size
+        if d == 0:
+            return "pdf_pad_stream"
+        if d < 0 and not _pdf_pad_len(dst):
+            return None
+        doc = fitz.open(dst)
+        xref = None
+        for x in range(1, doc.xref_length()):
+            try:
+                if doc.xref_get_key(x, "MasqueradingPad")[1] == "true":
+                    xref = x; break
+            except Exception:
+                pass
+        cur = len(doc.xref_stream_raw(xref)) if xref else 0
+        n = max(0, cur + d)
+        if xref is None:
+            xref = doc.get_new_xref()                       # objet vide : lui donner un dictionnaire AVANT le flux
+            doc.update_object(xref, "<< /MasqueradingPad true >>")
+            doc.update_stream(xref, b"\0" * max(1, n), new=True, compress=0)
+        else:
+            doc.update_stream(xref, b"\0" * max(1, n), compress=0)
+        tmp = dst + ".pad"
+        doc.save(tmp, garbage=0, deflate=False); doc.close()
+        os.replace(tmp, dst)
+    return "pdf_pad_stream" if os.path.getsize(dst) == target else None
+
+
+def _pdf_pad_len(dst):
+    import fitz
+    doc = fitz.open(dst)
+    for x in range(1, doc.xref_length()):
+        try:
+            if doc.xref_get_key(x, "MasqueradingPad")[1] == "true":
+                return len(doc.xref_stream_raw(x))
+        except Exception:
+            pass
+    return 0
+
+
+def _pad_png(dst, target):
+    """Bloc tEXt (« P » + espaces) inséré avant IEND : 12 octets d'en-tête/CRC + données. Si la sortie est plus grosse
+    que la cible, réencodage avec compress_level croissant."""
+    import struct, zlib
+    from PIL import Image
+    data = open(dst, "rb").read()
+    d = target - len(data)
+    if d < 14:
+        img = Image.open(io.BytesIO(data))
+        for lvl in range(6, 10):
+            buf = io.BytesIO(); img.save(buf, "PNG", compress_level=lvl); cand = buf.getvalue()
+            if target - len(cand) >= 14:
+                data = cand; d = target - len(data); break
+        if d < 14:
+            return None
+    payload = b"P\0" + b" " * (d - 12 - 2)
+    chunk = struct.pack(">I", len(payload)) + b"tEXt" + payload
+    chunk += struct.pack(">I", zlib.crc32(b"tEXt" + payload) & 0xFFFFFFFF)
+    i = data.rfind(b"IEND") - 4
+    out = data[:i] + chunk + data[i:]
+    open(dst, "wb").write(out)
+    return "png_text_chunk" if len(out) == target else None
+
+
+def _pad_jpeg(dst, target):
+    """Segments COM (FF FE, 4 octets d'en-tête + données ≤ 65 531) insérés après SOI. Sortie trop grosse → réencodage
+    à qualité décroissante jusqu'à laisser ≥ 4 octets de marge."""
+    from PIL import Image
+    data = open(dst, "rb").read()
+    d = target - len(data)
+    if d < 4:
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        for q in range(90, 54, -2):
+            buf = io.BytesIO(); img.save(buf, "JPEG", quality=q); cand = buf.getvalue()
+            if target - len(cand) >= 4:
+                data = cand; d = target - len(data); break
+        if d < 4:
+            return None
+    segs = b""
+    while d > 0:
+        n = min(d, 65535)
+        if d - n in (1, 2, 3):          # ne pas laisser un reste impossible à encoder
+            n = d - 4
+        segs += b"\xff\xfe" + (n - 2).to_bytes(2, "big") + b" " * (n - 4)
+        d -= n
+    out = data[:2] + segs + data[2:]
+    open(dst, "wb").write(out)
+    return "jpeg_com_segments" if len(out) == target else None
+
+
+def _pad_media_bytes(name, data, n):
+    """Ajoute `n` octets INCOMPRESSIBLES (aléatoires) à une image d'un paquet Office : bloc PNG privé « maSq » (ancillaire,
+    ignoré par les lecteurs) ou segments COM JPEG. Aléatoires pour que la taille déflatée suive la taille brute."""
+    import struct, zlib
+    ext = os.path.splitext(name)[1].lower()
+    if ext == ".png" and n >= 12:
+        payload = os.urandom(n - 12)
+        chunk = struct.pack(">I", len(payload)) + b"maSq" + payload + struct.pack(">I", zlib.crc32(b"maSq" + payload) & 0xFFFFFFFF)
+        i = data.rfind(b"IEND") - 4
+        return data[:i] + chunk + data[i:]
+    if ext in (".jpg", ".jpeg") and n >= 4:
+        segs = b""; d = n
+        while d > 0:
+            m = min(d, 65535)
+            if d - m in (1, 2, 3):
+                m = d - 4
+            segs += b"\xff\xfe" + (m - 2).to_bytes(2, "big") + os.urandom(m - 4); d -= m
+        return data[:2] + segs + data[2:]
+    return None
+
+
+def _pad_zip(dst, target):
+    """DOCX/XLSX : bourrage STOCKÉ (non compressé, donc linéaire) d'octets aléatoires, soit dans la plus grosse image du
+    paquet (bloc PNG privé / segments COM), soit — sans image — dans une partie `masquerading/pad.bin` déclarée dans
+    [Content_Types].xml (partie orpheline, licite en OPC). Le commentaire d'archive zip est PROSCRIT : LibreOffice refuse
+    alors d'ouvrir le document (« source file could not be loaded »). Sortie trop grosse → membres recompressés au
+    niveau 9. NB : SharePoint réécrit tout DOCX/XLSX déposé (+~10 Ko de métadonnées) — l'égalité tient en local."""
+    import zipfile, shutil
+    PAD_PART = "masquerading/pad.bin"
+
+    def rewrite(patch=None, extra=None, level=9):
+        # toujours niveau 9 : une réécriture au niveau par défaut regonflait les membres après un passage au niveau 9
+        # (38 510 → 36 160 → 39 891 o) et la convergence échouait
+        tmp = dst + ".rz"
+        with zipfile.ZipFile(dst) as zi, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=level) as zo:
+            for it in zi.infolist():
+                if it.filename == PAD_PART:
+                    continue
+                data = zi.read(it.filename)
+                if patch and it.filename == patch[0]:
+                    zo.writestr(it.filename, patch[1], compress_type=zipfile.ZIP_STORED)
+                    continue
+                if extra and it.filename == "[Content_Types].xml" and PAD_PART not in data.decode("utf-8", "ignore"):
+                    data = data.replace(b"</Types>", b'<Override PartName="/' + PAD_PART.encode() +
+                                        b'" ContentType="application/octet-stream"/></Types>')
+                zo.writestr(it, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=level)
+            if extra:
+                zo.writestr(PAD_PART, extra, compress_type=zipfile.ZIP_STORED)
+        shutil.move(tmp, dst)
+    backup = dst + ".bak"; shutil.copyfile(dst, backup)
+
+    def give_up():
+        shutil.move(backup, dst)                            # ne jamais laisser un fichier gonflé par un bourrage raté
+        return None
+    d = target - os.path.getsize(dst)
+    if d < 0:
+        rewrite(); d = target - os.path.getsize(dst)
+        if d < 0:
+            return give_up()
+    if d == 0:
+        os.unlink(backup); return "zip_recompressed"
+    with zipfile.ZipFile(dst) as z:
+        media = [it for it in z.infolist() if "/media/" in it.filename and it.filename.lower().endswith((".png", ".jpg", ".jpeg"))]
+        m = max(media, key=lambda it: it.file_size) if media else None
+        original = z.read(m.filename) if m else None
+    # l'image bourrée est écrite STOCKÉE : son ancienne compression (file_size − compress_size) est perdue → à déduire
+    stored_penalty = (m.file_size - m.compress_size) if m else 0
+    n = d - 64 - stored_penalty
+    if m and n < 16:                                        # pas assez d'écart pour absorber l'image stockée → partie dédiée
+        m = None; n = d - 200
+    n = max(16, n)
+    for _ in range(8):
+        if m:
+            padded = _pad_media_bytes(m.filename, original, n)
+            if padded is None:
+                return give_up()
+            rewrite(patch=(m.filename, padded)); method = "zip_media_pad"
+        else:
+            rewrite(extra=os.urandom(n)); method = "zip_pad_part"
+        d = target - os.path.getsize(dst)
+        if d == 0:
+            os.unlink(backup); return method
+        n += d
+        if n < 16:
+            return give_up()
+    return give_up()
+
+
+def _pad_rtf(dst, target):
+    """RTF : espaces avant l'accolade finale (ignorés par les lecteurs)."""
+    data = open(dst, "rb").read()
+    d = target - len(data)
+    if d < 0:
+        return None
+    i = data.rfind(b"}")
+    out = data[:i] + b" " * d + data[i:]
+    open(dst, "wb").write(out)
+    return "rtf_spaces" if len(out) == target else None
+
+
+def match_input_size(src, dst):
+    """Rend le fichier de sortie de la MÊME TAILLE que l'entrée quand la sortie est plus petite (ou compressible
+    jusqu'à l'être) : bourrage neutre propre à chaque format. Journal : {'in', 'out_before', 'out', 'method'} ;
+    'unmatched' si la sortie reste plus grosse que l'entrée (ex. image réencodée plus lourde)."""
+    ext = os.path.splitext(dst)[1].lower()
+    target = os.path.getsize(src); before = os.path.getsize(dst)
+    fn = {".pdf": _pad_pdf, ".png": _pad_png, ".jpg": _pad_jpeg, ".jpeg": _pad_jpeg, ".docx": _pad_zip, ".xlsx": _pad_zip,
+          ".rtf": _pad_rtf}.get(ext)
+    res = {"in": target, "out_before": before}
+    if fn is None:
+        res["unmatched"] = "format"; return res
+    try:
+        method = fn(dst, target)
+    except Exception as exc:  # noqa : le bourrage ne doit jamais faire échouer la sanitization
+        method = None; res["error"] = repr(exc)
+    res["out"] = os.path.getsize(dst)
+    if method:
+        res["method"] = method
+    else:
+        res["unmatched"] = "sortie plus grosse que l'entrée" if res["out"] > target else "non convergé"
+    return res
+
+
 def sanitize_image_file(src, dst, pz, strict):
     with open(src, "rb") as f:
         data = f.read()
@@ -2070,6 +2325,8 @@ def main():
                     shutil.copy2(src, dst); res = {"copied": True}
             except Exception as e:  # noqa
                 res = {"error": repr(e)}
+            if "error" not in res and "copied" not in res and os.environ.get("MATCH_INPUT_SIZE", "1") == "1":
+                res["size_match"] = match_input_size(src, dst)
             res["seconds"] = round(time.time() - t0, 2)
             n_txt = len(res.get("text_replacements", []))
             n_img = sum(len(i["replacements"]) for i in res.get("images", []))

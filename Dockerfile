@@ -1,6 +1,7 @@
 # Service de masquerading (masquage signifiant) (POC Securiti × SharePoint).
 # - fonts-dejavu (core+extra) : familles sans/bold/mono/serif/condensed pour la réécriture d'images (OCR) ; python:3.11-slim
-#   n'embarque aucune police.
+#   n'embarque aucune police. fonts-liberation(2) / carlito / caladea : équivalents métriques d'Arial, Times New Roman,
+#   Courier New, Calibri, Cambria pour réécrire les PDF clients avec la même chasse (voir _pdf_font_for).
 # - tesseract fra+deu+eng (+ osd) : OCR des images, des pages scannées et du 2e filet.
 # - libreoffice-writer (sans GUI, --no-install-recommends) : RTF <-> DOCX (sanitize_rtf). Java et les autres modules
 #   (calc, impress, GTK) ne sont pas installés. Mesure de l'image : voir README (taille avant/après).
@@ -9,7 +10,7 @@ FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       tesseract-ocr tesseract-ocr-fra tesseract-ocr-deu tesseract-ocr-eng \
-      fonts-dejavu curl \
+      fonts-dejavu fonts-liberation fonts-liberation2 fonts-crosextra-carlito fonts-crosextra-caladea curl \
       libreoffice-writer libreoffice-core libreoffice-common \
     && rm -rf /var/lib/apt/lists/* /usr/share/doc /usr/share/man
 
