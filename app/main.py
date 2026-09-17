@@ -186,7 +186,8 @@ class ScanReq(BaseModel):
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok", "queue": jobs.qsize(), "formats": SUPPORTED_FORMATS, **state}
+    return {"status": "ok", "version": os.environ.get("GIT_SHA", "dev"), "queue": jobs.qsize(),
+            "formats": SUPPORTED_FORMATS, **state}
 
 
 def _load_mapping():

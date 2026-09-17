@@ -26,5 +26,9 @@ USER 10001
 # LibreOffice écrit un profil utilisateur : chaque conversion utilise -env:UserInstallation=file:///tmp/lo_<pid>_…
 ENV SOFFICE=/usr/bin/soffice HOME=/home/masquerading
 
+# Commit de build (CI : --build-arg GIT_SHA=<sha court>) exposé par GET /healthz → on sait quelle version tourne derrière Portainer.
+ARG GIT_SHA=dev
+ENV GIT_SHA=$GIT_SHA
+
 EXPOSE 8080
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
