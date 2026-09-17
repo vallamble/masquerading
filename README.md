@@ -72,10 +72,14 @@ Everything the engine cannot process is **fail-closed**: logged in the per-file 
   two page-segmentation modes, with numeric-token normalization (O/0, I/1, S/5…) so a misread
   digit can't hide an identifier. **Fail-closed**: any IBAN-shaped string whose checksum is
   doubtful is matched to the table (Levenshtein ≤ 2) or replaced by a generated IBAN — never left
-  in clear. Low-confidence names/addresses are matched to the table (distance ≤ 1). Rendering
-  fits the pseudonym to the box and picks a DejaVu family (sans/bold/mono/serif/condensed) by
-  minimal width error. Ink zones OCR can't read at all (signatures, handwriting) are scored as
-  `UNREAD_INK` in the log for manual review.
+  in clear. Low-confidence names/addresses are matched to the table (distance ≤ 1). **Rendering
+  keeps the image's typography**: the page skew is measured on the pixels (projection profile) and
+  removed from every OCR box height (a tilted 800 px number used to "measure" 20 px taller than a
+  200 px name next to it), the font size is fitted on the original text and then homogenised per
+  size cluster over the whole image (one style = one size), and the DejaVu family
+  (sans/bold/mono/serif/condensed) is chosen per cluster by cumulative width error, never word by
+  word. `font_px` and `skew` are logged per replacement. Ink zones OCR can't read at all
+  (signatures, handwriting) are scored as `UNREAD_INK` in the log for manual review.
 
 ## Image
 
@@ -99,7 +103,7 @@ cd deploy && cp .env.example .env   # then fill in the secrets
 docker stack deploy -c docker-compose.yml masquerading   # or deploy via Portainer
 ```
 
-## Status (2026-09-16)
+## Status (2026-09-17)
 
 | Check | Result |
 |---|---|
@@ -107,6 +111,7 @@ docker stack deploy -c docker-compose.yml masquerading   # or deploy via Portain
 | Gap dataset (RTF, scanned PDF with `/Rotate 90`, DOCX with embedded XLSX + preview, PDF with attachment, signed forms) | **0 leaks / 314**, 0 decoys / 8, 3/3 signatures at 0 % residual ink, 6/6 frames and rules intact |
 | End-to-end on the deployed service (Graph upload → `POST /sanitize` → `Documents/Output/gap/`) | 6/6 files processed in < 1 min, same evaluation result as local |
 | Container image | 657 MB → 1.12 GB (LibreOffice writer, headless) |
+| In-image typography (Valery, 17.09: font size changed from word to word) | fixed: skew-corrected box heights, one size per style cluster, one family per cluster; e.g. insurance card 5/5 values at 51 px bold (was 60–81 px, mixed sans/condensed) |
 
 Known limits, logged for review rather than processed: OLE `.bin` objects that are not Office packages, EMF/WMF previews
 of embedded objects (Word-generated), a signature drawn over text (the text under it is erased too), native RTF patching
