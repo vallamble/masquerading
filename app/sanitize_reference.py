@@ -220,7 +220,17 @@ _FONT_FAMILIES = [
      "/System/Library/Fonts/Supplemental/Times New Roman.ttf"),
     ("condensed", "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf", *(d + "/DejaVuSansCondensed.ttf" for d in _LO_FONTS),
      "/System/Library/Fonts/Supplemental/Arial Narrow.ttf"),
+    # variantes penchées : choisies seulement quand les glyphes d'origine sont inclinés (_ink_slant), jamais par la largeur
+    ("sans-oblique", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf", *(d + "/DejaVuSans-Oblique.ttf" for d in _LO_FONTS),
+     "/System/Library/Fonts/Supplemental/Arial Italic.ttf"),
+    ("sans-bold-oblique", "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf", *(d + "/DejaVuSans-BoldOblique.ttf" for d in _LO_FONTS),
+     "/System/Library/Fonts/Supplemental/Arial Bold Italic.ttf"),
+    ("serif-italic", "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf", *(d + "/DejaVuSerif-Italic.ttf" for d in _LO_FONTS),
+     "/System/Library/Fonts/Supplemental/Times New Roman Italic.ttf"),
+    ("condensed-oblique", "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Oblique.ttf", *(d + "/DejaVuSansCondensed-Oblique.ttf" for d in _LO_FONTS)),
 ]
+_ITALIC_OF = {"sans": "sans-oblique", "sans-bold": "sans-bold-oblique", "serif": "serif-italic", "condensed": "condensed-oblique"}
+
 
 
 def _font_candidates():
@@ -537,6 +547,35 @@ def _tighten_box(img, box, bg):
         return box
 
 
+def _ink_slant(img, box, bg):
+    """Inclinaison des glyphes (tan) dans une boîte : on « redresse » le masque d'encre par cisaillement s et on garde
+    le s qui concentre le plus l'encre en colonnes (somme des carrés de l'histogramme par colonne, maximale quand les
+    fûts deviennent verticaux). Texte droit ≈ 0, DejaVu Oblique/Italic ≈ 0,2. Sert à réécrire un champ « manuscrit »
+    (italique) en italique plutôt qu'en droit. None si trop peu d'encre."""
+    try:
+        import numpy as np
+        x0, y0, x1, y1 = box
+        a = np.asarray(img.crop((x0, y0, x1, y1))).astype(int)
+        ink = np.abs(a - np.array(bg)).sum(axis=2) > 60
+        h, w = ink.shape
+        if ink.sum() < 30 or h < 6:
+            return None
+        ys, xs = np.nonzero(ink)
+        best, best_s = -1.0, 0.0
+        for s in np.arange(-0.10, 0.46, 0.04):
+            # redressement : le haut des glyphes (y petit) est ramené vers la gauche de s × hauteur ; pas de clip
+            # (un clip empilait les pixels sur le bord et faisait gagner le cisaillement maximal)
+            xs2 = np.round(xs - s * ((h - 1) - ys)).astype(int)
+            xs2 -= xs2.min()
+            hist = np.bincount(xs2)
+            score = float((hist.astype(float) ** 2).sum())
+            if score > best:
+                best, best_s = score, float(s)
+        return best_s
+    except Exception:
+        return None
+
+
 def _numeric_like(s):
     return sum(ch.isalpha() for ch in s) <= 2
 
@@ -619,7 +658,7 @@ def _paint_candidates(img, candidates, fonts, extra_tag=None, words=None):
     def pick_family(idx, base):
         # une famille ne supplante la famille de base que si elle réduit l'erreur de largeur cumulée de ≥ 25 % :
         # DejaVu Sans et Serif ont des chasses quasi identiques, la largeur seule les départage au hasard
-        errs = {fam: sum(items[i]["fits"][fam][1] for i in idx) for fam in fonts}
+        errs = {fam: sum(items[i]["fits"][fam][1] for i in idx) for fam in fonts if fam not in _ITALIC_OF.values()}
         best = min(errs, key=errs.get)
         return best if base not in errs or errs[best] < 0.75 * errs[base] else base
     ref_fam = pick_family(range(len(items)), "sans")          # famille de référence de l'image
@@ -639,9 +678,27 @@ def _paint_candidates(img, candidates, fonts, extra_tag=None, words=None):
     # famille par grappe de corps (un style = une famille), la référence de l'image sauf écart net
     fam_of = {}
     for cl in set(clusters.values()):
-        fam_of[cl] = pick_family([i for i, c in clusters.items() if c == cl], ref_fam)
+        idx = [i for i, c in clusters.items() if c == cl]
+        fam_of[cl] = pick_family(idx, ref_fam)
+    # glyphes penchés → variante oblique/italique de la famille. Mesure par MOT (pas par grappe : sur un formulaire, champs
+    # « manuscrits » italiques et champs droits ont le même corps), puis médiane par COULEUR D'ENCRE : un même stylo =
+    # un même style, et un mot court à diagonales (« Waeber ») se mesure mal seul
+    for it in items:
+        it["slant"] = _ink_slant(img, it["box"], it["bg"])
+    by_ink = {}
+    for i, it in enumerate(items):
+        by_ink.setdefault(tuple(c // 48 for c in it["ink"]), []).append(i)
+    for idx in by_ink.values():
+        sl = sorted(items[i]["slant"] for i in idx if items[i]["slant"] is not None)
+        if len(sl) >= 2:
+            for i in idx:
+                items[i]["slant"] = sl[len(sl) // 2]
     for i, it in enumerate(items):
         fam = fam_of[clusters[i]]
+        if it["slant"] is not None:
+            it["slant"] = round(it["slant"], 2)
+            if it["slant"] >= 0.10 and _ITALIC_OF.get(fam) in fonts:      # droit mesuré à ±0,02, oblique DejaVu à 0,18
+                fam = _ITALIC_OF[fam]
         it["fam"] = fam
         it["size"] = max(6, int(round(clusters[i] * it["fits"][fam][0].size / max(it["fits"][ref_fam][0].size, 1))))
         it["r"] = it["rep"].upper() if (it["v"].isupper() and it["dtype"] in ("FIRST_NAME", "LAST_NAME")) else it["rep"]
@@ -725,6 +782,8 @@ def _paint_candidates(img, candidates, fonts, extra_tag=None, words=None):
                          "font_px": font.size, "skew": round(slope, 4), "match": it["how"], "ocr_conf_min": it["conf"]}
                 if it["box"] != it["ocr_box"]:
                     entry["tightened_box"] = it["box"]
+                if it.get("slant") is not None:
+                    entry["slant"] = it["slant"]
                 if xd != x0:
                     entry["x_shift"] = xd - x0
                 if f < 1.0:
@@ -1706,15 +1765,37 @@ def _pdf_spans(page):
     return out
 
 
-def _pdf_base14(fontname, flags):
-    """Police de base 14 la plus proche du span d'origine (les polices du PDF ne sont pas forcément réutilisables)."""
+_TTF_DIRS = ["/usr/share/fonts/truetype/dejavu"] + list(_LO_FONTS)
+
+
+def _pdf_font_for(fontname, flags):
+    """(nom de police PyMuPDF, fichier TTF ou None) le plus fidèle au span d'origine.
+    Flags PyMuPDF : 1 exposant, 2 italique, 4 « serifed » (peu fiable : DejaVuSans l'a), 8 monospace, 16 gras.
+    1) Une police DejaVu d'origine (Sans / Serif / Mono × Bold × Oblique/Italic) est réutilisée depuis le fichier TTF
+       présent dans le conteneur (fonts-dejavu) ou dans LibreOffice sur macOS : un « Keller » en Helvetica au milieu
+       d'une page en DejaVu Sans se voit tout de suite. 2) Sinon base 14 par nom puis flags (gras, italique, mono ;
+       serif par le NOM seulement)."""
     name = (fontname or "").lower()
-    bold = bool(flags & 16) or "bold" in name or "black" in name or "heavy" in name
-    if flags & 8 or "mono" in name or "courier" in name:
-        return "cobo" if bold else "cour"
-    if flags & 2 or "times" in name or "serif" in name or "georgia" in name or "garamond" in name:
-        return "tibo" if bold else "tiro"
-    return "hebo" if bold else "helv"
+    bold = bool(flags & 16) or any(k in name for k in ("bold", "black", "heavy", "semibold"))
+    italic = bool(flags & 2) or any(k in name for k in ("italic", "oblique"))
+    mono = bool(flags & 8) or any(k in name for k in ("mono", "courier", "consolas", "menlo"))
+    serif = any(k in name for k in ("times", "serif", "georgia", "garamond", "cambria", "book")) and "sans" not in name
+    if "dejavu" in name:
+        fam = "DejaVuSansMono" if mono else ("DejaVuSerif" if "serif" in name else "DejaVuSans")
+        style = ("-Bold" if bold else "") + (("Italic" if fam == "DejaVuSerif" else "Oblique") if italic else "")
+        if bold and italic:
+            style = "-Bold" + ("Italic" if fam == "DejaVuSerif" else "Oblique")
+        elif italic:
+            style = "-" + ("Italic" if fam == "DejaVuSerif" else "Oblique")
+        for d in _TTF_DIRS:
+            path = os.path.join(os.path.expanduser(d), fam + style + ".ttf")
+            if os.path.exists(path):
+                return "F" + hashlib.md5(path.encode()).hexdigest()[:8], path
+    if mono:
+        return ("cobi" if bold and italic else "cobo" if bold else "coit" if italic else "cour"), None
+    if serif:
+        return ("tibi" if bold and italic else "tibo" if bold else "tiit" if italic else "tiro"), None
+    return ("hebi" if bold and italic else "hebo" if bold else "heit" if italic else "helv"), None
 
 
 def _pdf_reinsert(page, rects, words, spans, fitz):
@@ -1736,10 +1817,11 @@ def _pdf_reinsert(page, rects, words, spans, fitz):
                 best, bo = (size, base, fname, flags, rgb), ix * iy
         if best:
             size, base, fname, flags, rgb = best
-            fn = _pdf_base14(fname, flags)
+            fn, ff = _pdf_font_for(fname, flags)
         else:
-            size, base, fn, rgb = max(5.0, r.height * 0.78), r.y1 - 0.22 * r.height, "helv", (0, 0, 0)
-        items.append({"r": r, "v": v, "dtype": dtype, "rr": rr, "size": float(size), "base": base, "fn": fn, "rgb": rgb})
+            size, base, fn, ff, rgb = max(5.0, r.height * 0.78), r.y1 - 0.22 * r.height, "helv", None, (0, 0, 0)
+        items.append({"r": r, "v": v, "dtype": dtype, "rr": rr, "size": float(size), "base": base, "fn": fn, "ff": ff,
+                      "rgb": rgb, "src_font": best[2] if best else None})
     if not items:
         return []
     log = []
@@ -1780,23 +1862,31 @@ def _pdf_reinsert(page, rects, words, spans, fitz):
             avail = max(last["r"].x1, limit) - first["r"].x0
             gaps = [max(0.0, items[b]["r"].x0 - items[a]["r"].x1) for a, b in zip(ch, ch[1:])]
 
+            def tlen(it, fs):
+                if it["ff"]:
+                    return fitz.Font(fontfile=it["ff"]).text_length(it["rr"], fontsize=fs)
+                return fitz.get_text_length(it["rr"], fontname=it["fn"], fontsize=fs)
+
             def needed(f):
-                return sum(gaps) + sum(fitz.get_text_length(items[i]["rr"], fontname=items[i]["fn"],
-                                                            fontsize=max(4.0, items[i]["size"] * f)) for i in ch)
+                return sum(gaps) + sum(tlen(items[i], max(4.0, items[i]["size"] * f)) for i in ch)
             f = 1.0
             while f > 0.3 and needed(f) > avail:
                 f -= 0.025
             x = first["r"].x0
             for k, i in enumerate(ch):
                 it = items[i]; fs = max(4.0, round(it["size"] * f, 2))
-                page.insert_text((x, it["base"]), it["rr"], fontsize=fs, fontname=it["fn"], color=it["rgb"])
-                e = {"type": it["dtype"], "original": it["v"], "replacement": it["rr"], "fontsize": fs, "font": it["fn"]}
+                if it["ff"]:
+                    page.insert_text((x, it["base"]), it["rr"], fontsize=fs, fontname=it["fn"], fontfile=it["ff"], color=it["rgb"])
+                else:
+                    page.insert_text((x, it["base"]), it["rr"], fontsize=fs, fontname=it["fn"], color=it["rgb"])
+                e = {"type": it["dtype"], "original": it["v"], "replacement": it["rr"], "fontsize": fs,
+                     "font": os.path.basename(it["ff"]) if it["ff"] else it["fn"], "source_font": it["src_font"]}
                 if abs(x - it["r"].x0) > 0.5:
                     e["x_shift"] = round(x - it["r"].x0, 1)
                 if f < 1.0:
                     e["chain_scale"] = round(f, 3)
                 log.append(e)
-                x += fitz.get_text_length(it["rr"], fontname=it["fn"], fontsize=fs) + (gaps[k] if k < len(gaps) else 0)
+                x += tlen(it, fs) + (gaps[k] if k < len(gaps) else 0)
     return log
 
 
@@ -1882,6 +1972,10 @@ def sanitize_pdf(src, dst, pz, strict):
                             desc=info.get("desc") or "")
         else:
             review.append({"type": e.get("type", "EMBEDDED_UNSUPPORTED"), "object": fname, "reason": e.get("reason")})
+    try:
+        doc.subset_fonts()          # polices TTF réinsérées (DejaVu) réduites aux glyphes utilisés : 2,6 Mo -> 1,7 Mo
+    except Exception:
+        pass
     doc.save(dst, garbage=4, clean=True, deflate=True)
     res = {"text_replacements": log, "images": img_log, "pages": pages_log}
     if emb_log:

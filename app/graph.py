@@ -66,9 +66,27 @@ class GraphClient:
         return {"Authorization": f"Bearer {self.token()}"}
 
     def _get(self, url, **kw):
-        r = requests.get(url, headers=self._h(), timeout=60, **kw)
-        r.raise_for_status()
-        return r
+        return self._retry(lambda: requests.get(url, headers=self._h(), timeout=60, **kw))
+
+    @staticmethod
+    def _retry(call, tries=4):
+        """Graph répond parfois par un timeout ou un 429/5xx transitoire (un ReadTimeout de 300 s a cassé un bout-en-bout
+        de 11 fichiers) : on rejoue jusqu'à 4 fois avec attente croissante, puis on laisse remonter l'erreur."""
+        import time
+        last = None
+        for i in range(tries):
+            try:
+                r = call()
+                if r.status_code in (429, 500, 502, 503, 504) and i < tries - 1:
+                    time.sleep(float(r.headers.get("Retry-After", 5 * (i + 1)))); continue
+                r.raise_for_status()
+                return r
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                last = exc
+                if i == tries - 1:
+                    raise
+                time.sleep(5 * (i + 1))
+        raise last
 
     # --- site / drive -------------------------------------------------------
     def drive_id(self):
@@ -122,13 +140,11 @@ class GraphClient:
         """Upload local -> drive:/<path>. Session d'upload au-delà de 4 MB."""
         size = os.path.getsize(local)
         if size <= 4 * 1024 * 1024:
-            with open(local, "rb") as f:
-                r = requests.put(
-                    f"{GRAPH}/drives/{self.drive_id()}/root:/{path}:/content",
-                    headers=self._h(), data=f, timeout=300,
-                )
-            r.raise_for_status()
-            return r.json()
+            def put():
+                with open(local, "rb") as f:
+                    return requests.put(f"{GRAPH}/drives/{self.drive_id()}/root:/{path}:/content",
+                                        headers=self._h(), data=f, timeout=300)
+            return self._retry(put).json()
         j = requests.post(
             f"{GRAPH}/drives/{self.drive_id()}/root:/{path}:/createUploadSession",
             headers=self._h(),
