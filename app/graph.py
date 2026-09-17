@@ -128,6 +128,13 @@ class GraphClient:
         walk(path, "")
         return out
 
+    def delete(self, path):
+        """Supprime drive:/<path> (fichier ou dossier, récursif côté Graph). 404 = déjà absent, ignoré."""
+        r = requests.delete(f"{GRAPH}/drives/{self.drive_id()}/root:/{path}", headers=self._h(), timeout=60)
+        if r.status_code not in (204, 404):
+            r.raise_for_status()
+        return r.status_code
+
     def download(self, path, local):
         """Télécharge drive:/<path> vers un fichier local."""
         r = self._get(f"{GRAPH}/drives/{self.drive_id()}/root:/{path}:/content", stream=True)
