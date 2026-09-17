@@ -52,8 +52,19 @@ def main():
         rel = f"{a.subdir}/{fn}"
         gc.upload(f"{inbound}/{rel}", local)
         sizes[fn] = os.path.getsize(local)
-        r = requests.post(f"{url}/sanitize", headers={"X-Api-Key": key}, json={"file_path": f"{inbound}/{rel}"}, timeout=60)
-        print("upload + POST", rel, r.status_code, r.json())
+        for attempt in range(6):        # Traefik renvoie un 502/504 HTML pendant un redéploiement Swarm : on réessaie
+            try:
+                r = requests.post(f"{url}/sanitize", headers={"X-Api-Key": key}, json={"file_path": f"{inbound}/{rel}"}, timeout=60)
+                body = r.json() if r.status_code < 500 else None
+            except (requests.RequestException, ValueError):
+                body = None
+            if body is not None and r.status_code < 400:
+                break
+            print("  POST", rel, "essai", attempt + 1, "->", getattr(r, "status_code", "?"), "; nouvel essai dans 10 s")
+            time.sleep(10)
+        else:
+            print("ECHEC : POST /sanitize refusé pour", rel); sys.exit(2)
+        print("upload + POST", rel, r.status_code, body)
     print("attente des sorties dans", f"{output}/{a.subdir} …")
     t0 = time.time()
     pending = set(files)
