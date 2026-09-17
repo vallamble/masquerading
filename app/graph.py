@@ -1,8 +1,8 @@
-"""Client Microsoft Graph app-only (client credentials) pour SharePoint.
+"""App-only Microsoft Graph client (client credentials) for SharePoint.
 
-Lit Inbound et écrit Output dans la bibliothèque de documents du site d'Alice.
-Permissions Entra requises : Sites.Selected (write sur le site) ou Files.ReadWrite.All,
-consenties par l'admin du tenant. Aucune valeur secrète ici — tout vient de l'env.
+Reads Inbound and writes Output in the document library of Alice's site.
+Required Entra permissions: Sites.Selected (write on the site) or Files.ReadWrite.All,
+consented by the tenant admin. No secret value here — everything comes from the env.
 """
 import os
 import time
@@ -10,12 +10,12 @@ import time
 import requests
 
 GRAPH = "https://graph.microsoft.com/v1.0"
-UPLOAD_CHUNK = 5 * 1024 * 1024  # multiple de 320 KiB requis par Graph ; 5 MiB
+UPLOAD_CHUNK = 5 * 1024 * 1024  # multiple of 320 KiB required by Graph; 5 MiB
 
 
 def secret(name, default=None, required=False):
-    """Valeur de $NAME, ou contenu du fichier $NAME_FILE (secrets Docker Swarm montés dans /run/secrets/<nom>),
-    ou /run/secrets/<NAME> s'il existe. Espaces et fin de ligne retirés."""
+    """Value of $NAME, or content of the file $NAME_FILE (Docker Swarm secrets mounted in /run/secrets/<name>),
+    or /run/secrets/<NAME> if it exists. Whitespace and trailing newline stripped."""
     v = os.environ.get(name)
     if not v:
         path = os.environ.get(name + "_FILE") or (f"/run/secrets/{name}" if os.path.exists(f"/run/secrets/{name}") else None)
@@ -34,7 +34,7 @@ class GraphClient:
         self.tenant = secret("GRAPH_TENANT_ID", required=True)
         self.client_id = secret("GRAPH_CLIENT_ID", required=True)
         self.client_secret = secret("GRAPH_CLIENT_SECRET", required=True)
-        # ex. SP_HOSTNAME=cyberdux.sharepoint.com  SP_SITE_PATH=/sites/AliceTeam
+        # e.g. SP_HOSTNAME=cyberdux.sharepoint.com  SP_SITE_PATH=/sites/AliceTeam
         self.hostname = secret("SP_HOSTNAME", required=True)
         self.site_path = secret("SP_SITE_PATH", default="") or ""
         self._token = None
@@ -69,9 +69,9 @@ class GraphClient:
         return self._retry(lambda: requests.get(url, headers=self._h(), timeout=60, **kw))
 
     @staticmethod
-    def _retry(call, tries=4):
-        """Graph répond parfois par un timeout ou un 429/5xx transitoire (un ReadTimeout de 300 s a cassé un bout-en-bout
-        de 11 fichiers) : on rejoue jusqu'à 4 fois avec attente croissante, puis on laisse remonter l'erreur."""
+    def _retry(call, tries=4, ok=()):
+        """Graph sometimes answers with a timeout or a transient 429/5xx (a 300 s ReadTimeout broke an end-to-end
+        run of 11 files): we retry up to 4 times with increasing wait, then let the error propagate."""
         import time
         last = None
         for i in range(tries):
@@ -79,6 +79,8 @@ class GraphClient:
                 r = call()
                 if r.status_code in (429, 500, 502, 503, 504) and i < tries - 1:
                     time.sleep(float(r.headers.get("Retry-After", 5 * (i + 1)))); continue
+                if r.status_code in ok:
+                    return r
                 r.raise_for_status()
                 return r
             except (requests.Timeout, requests.ConnectionError) as exc:
@@ -92,8 +94,8 @@ class GraphClient:
     def drive_id(self):
         if self._drive_id:
             return self._drive_id
-        # SP_SITE_PATH vide = site racine du tenant (GET /sites/{hostname});
-        # sinon un site nommé (GET /sites/{hostname}:/sites/X).
+        # empty SP_SITE_PATH = tenant root site (GET /sites/{hostname});
+        # otherwise a named site (GET /sites/{hostname}:/sites/X).
         if self.site_path.strip("/"):
             site = self._get(f"{GRAPH}/sites/{self.hostname}:{self.site_path}").json()
         else:
@@ -105,12 +107,12 @@ class GraphClient:
             if d["name"] == drive_name:
                 self._drive_id = d["id"]
                 return self._drive_id
-        raise RuntimeError(f"bibliothèque {drive_name!r} introuvable sur {self.site_path}")
+        raise RuntimeError(f"library {drive_name!r} not found on {self.site_path}")
 
-    # --- lecture ------------------------------------------------------------
+    # --- read ---------------------------------------------------------------
     def list_folder(self, path):
-        """Liste récursivement les fichiers sous <path> (ex. 'Inbound').
-        Retourne [(chemin relatif à <path>, item)]."""
+        """Recursively lists the files under <path> (e.g. 'Inbound').
+        Returns [(path relative to <path>, item)]."""
         out = []
 
         def walk(p, rel):
@@ -129,26 +131,25 @@ class GraphClient:
         return out
 
     def item(self, path):
-        """Métadonnées de drive:/<path> (dont `size` telle que STOCKÉE par SharePoint)."""
+        """Metadata of drive:/<path> (including `size` as STORED by SharePoint)."""
         return self._get(f"{GRAPH}/drives/{self.drive_id()}/root:/{path}").json()
 
     def delete(self, path):
-        """Supprime drive:/<path> (fichier ou dossier, récursif côté Graph). 404 = déjà absent, ignoré."""
-        r = requests.delete(f"{GRAPH}/drives/{self.drive_id()}/root:/{path}", headers=self._h(), timeout=60)
-        if r.status_code not in (204, 404):
-            r.raise_for_status()
+        """Deletes drive:/<path> (file or folder, recursive on the Graph side). 404 = already absent, ignored."""
+        r = self._retry(lambda: requests.delete(f"{GRAPH}/drives/{self.drive_id()}/root:/{path}", headers=self._h(), timeout=60),
+                        ok=(204, 404))
         return r.status_code
 
     def download(self, path, local):
-        """Télécharge drive:/<path> vers un fichier local."""
+        """Downloads drive:/<path> to a local file."""
         r = self._get(f"{GRAPH}/drives/{self.drive_id()}/root:/{path}:/content", stream=True)
         with open(local, "wb") as f:
             for chunk in r.iter_content(1024 * 256):
                 f.write(chunk)
 
-    # --- écriture -----------------------------------------------------------
+    # --- write --------------------------------------------------------------
     def upload(self, path, local):
-        """Upload local -> drive:/<path>. Session d'upload au-delà de 4 MB."""
+        """Uploads local -> drive:/<path>. Upload session above 4 MB."""
         size = os.path.getsize(local)
         if size <= 4 * 1024 * 1024:
             def put():

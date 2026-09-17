@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-synth_core.py — Génération d'entités 100 % fictives + validateurs (IBAN mod-97, AHV EAN-13, Luhn)
-et table de pseudonymisation cohérente. Utilisé par generate_dataset.py.
+synth_core.py — Generation of 100% fictitious entities + validators (IBAN mod-97, AHV EAN-13, Luhn)
+and consistent pseudonymization table. Used by generate_dataset.py.
 
-Toute personne, adresse, numéro ou identifiant produit ici est synthétique.
-Les numéros de carte sont des numéros de TEST publics (Stripe/Braintree docs), les e-mails
-utilisent des domaines réservés (example.ch / example.com / exemple.fr — RFC 2606 / AFNIC).
+Every person, address, number or identifier produced here is synthetic.
+Card numbers are public TEST numbers (Stripe/Braintree docs), e-mails
+use reserved domains (example.ch / example.com / exemple.fr — RFC 2606 / AFNIC).
 """
 import random
 import datetime as dt
 import string
 
 # ----------------------------------------------------------------------------
-# Validateurs / générateurs de formats
+# Validators / format generators
 # ----------------------------------------------------------------------------
 
 def _iban_to_numeric(s: str) -> str:
@@ -44,9 +44,9 @@ def iban_format(iban_compact: str) -> str:
 
 
 def gen_iban(rng: random.Random, country: str) -> str:
-    """Retourne un IBAN compact valide (mod-97) pour CH / DE / FR / AT, comptes fictifs."""
+    """Returns a valid compact IBAN (mod-97) for CH / DE / FR / AT, fictitious accounts."""
     if country == "CH":
-        bank = "%05d" % rng.randint(80000, 89999)          # clearing fictif
+        bank = "%05d" % rng.randint(80000, 89999)          # fictitious clearing number
         acct = "".join(rng.choice(string.digits) for _ in range(12))
         bban = bank + acct
     elif country == "DE":
@@ -69,7 +69,7 @@ def gen_iban(rng: random.Random, country: str) -> str:
 
 
 def gen_invalid_iban_like(rng: random.Random) -> str:
-    """Leurre : ressemble à un IBAN CH mais checksum mod-97 volontairement fausse."""
+    """Decoy: looks like a CH IBAN but with a deliberately wrong mod-97 checksum."""
     while True:
         good = gen_iban(rng, "CH")
         cd = int(good[2:4])
@@ -87,7 +87,7 @@ def ean13_check_digit(d12: str) -> str:
 
 
 def gen_ahv(rng: random.Random) -> str:
-    """N° AVS/AHV suisse fictif : 756.XXXX.XXXX.XX avec chiffre de contrôle EAN-13 correct."""
+    """Fictitious Swiss AVS/AHV number: 756.XXXX.XXXX.XX with a correct EAN-13 check digit."""
     d12 = "756" + "".join(rng.choice(string.digits) for _ in range(9))
     d13 = d12 + ean13_check_digit(d12)
     return "%s.%s.%s.%s" % (d13[0:3], d13[3:7], d13[7:11], d13[11:13])
@@ -124,7 +124,7 @@ def gen_non_luhn_16(rng: random.Random) -> str:
             return " ".join(s[i:i + 4] for i in range(0, 16, 4))
 
 
-# Numéros de carte de TEST publics (documentation Stripe / Braintree / PayPal). Jamais des cartes réelles.
+# Public TEST card numbers (Stripe / Braintree / PayPal documentation). Never real cards.
 TEST_CARDS = [
     ("Visa", "4242 4242 4242 4242"),
     ("Visa", "4012 8888 8888 1881"),
@@ -139,7 +139,7 @@ TEST_CARDS = [
     ("Discover", "6011 1111 1111 1117"),
     ("Discover", "6011 0009 9013 9424"),
 ]
-# Pool DISJOINT de numéros de TEST publics (Stripe) pour les substitutions -> aucune collision original/substitution
+# DISJOINT pool of public TEST numbers (Stripe) for the substitutions -> no original/substitution collision
 TEST_CARDS_PSEUDO = [
     ("Visa", "4000 0075 6000 0009"),   # test CH
     ("Visa", "4000 0027 6000 0016"),   # test DE
@@ -157,7 +157,7 @@ TEST_CARDS_PSEUDO = [
 ]
 
 # ----------------------------------------------------------------------------
-# Pools de noms (originaux) et pools de pseudonymes (DISJOINTS)
+# Name pools (originals) and pseudonym pools (DISJOINT)
 # ----------------------------------------------------------------------------
 FIRST_M_ORIG = ["Eduard", "Julien", "Nicolas", "Pierre-Alain", "Laurent", "Mathieu", "Sébastien", "Olivier",
                 "Frédéric", "Yann", "Cédric", "Thierry", "Romain", "Fabien", "Loïc", "Xavier",
@@ -233,7 +233,7 @@ CITIES = [("1201", "Genève"), ("1205", "Genève"), ("1003", "Lausanne"), ("1007
 INSURERS = ["Alpina Assurances Fictives SA", "Helvetia-Nord Krankenkasse (fiktiv)", "Mutuelle du Léman Fictive",
             "Caisse-Maladie Jura-Fictive", "Sanitas-Süd Versicherung (fiktiv)"]
 
-# Diagnostics (code ICD-10, libellé FR, libellé DE, généralisation "stricte" = chapitre)
+# Diagnoses (ICD-10 code, FR label, DE label, "strict" generalization = chapter)
 DIAGNOSES = [
     ("E11.9", "Diabète sucré de type 2 sans complication", "Diabetes mellitus Typ 2 ohne Komplikationen", "E00-E90 Maladies endocriniennes"),
     ("I10", "Hypertension essentielle", "Essentielle Hypertonie", "I00-I99 Maladies de l'appareil circulatoire"),
@@ -248,7 +248,7 @@ DIAGNOSES = [
     ("I25.1", "Cardiopathie athéroscléreuse", "Atherosklerotische Herzkrankheit", "I00-I99 Maladies de l'appareil circulatoire"),
     ("F10.2", "Troubles mentaux liés à l'alcool, syndrome de dépendance", "Alkoholabhängigkeitssyndrom", "F00-F99 Troubles mentaux et du comportement"),
 ]
-# Médications associées (nom + posologie, classe ATC pour la généralisation stricte)
+# Associated medications (name + dosage, ATC class for the strict generalization)
 MEDS_BY_DX = {
     "E11.9": [("Metformine 850 mg 2x/j", "Antidiabétique oral (A10B)"), ("Insuline glargine 20 UI le soir", "Insuline (A10AE)")],
     "I10": [("Lisinopril 10 mg 1x/j", "Inhibiteur de l'ECA (C09A)"), ("Amlodipine 5 mg 1x/j", "Inhibiteur calcique (C08CA)")],
@@ -265,11 +265,11 @@ MEDS_BY_DX = {
 }
 
 # ----------------------------------------------------------------------------
-# Substitutions DÉTERMINISTES par valeur (une même valeur originale -> toujours la même substitution)
+# DETERMINISTIC substitutions by value (the same original value -> always the same substitution)
 # ----------------------------------------------------------------------------
 import hashlib as _hashlib
 
-_CITY_SHIFT = 7  # dérangement : rotation de 7 sur 26 villes => aucune ville ne se substitue à elle-même
+_CITY_SHIFT = 7  # derangement: rotation by 7 over 26 cities => no city is substituted by itself
 
 
 def pseudo_city(npa: str, city: str):
@@ -281,7 +281,7 @@ def pseudo_street(street_with_number: str) -> str:
     name, num = street_with_number.rsplit(" ", 1)
     idx = STREETS_ORIG.index(name)
     n = int(num)
-    return "%s %d" % (STREETS_PSEUDO[idx], ((n * 7) % 120) + 1)   # 6n ≡ -1 (mod 120) impossible => jamais identique
+    return "%s %d" % (STREETS_PSEUDO[idx], ((n * 7) % 120) + 1)   # 6n ≡ -1 (mod 120) impossible => never identical
 
 
 def pseudo_dob(d: dt.date) -> dt.date:
@@ -319,7 +319,7 @@ def email_for(first: str, last: str, rng: random.Random) -> str:
 
 
 def phone_ch(rng: random.Random, mobile: bool) -> str:
-    # Numéros synthétiques : blocs "000" improbables ; voir README.
+    # Synthetic numbers: implausible "000" blocks; see README.
     if mobile:
         return "+41 79 000 %02d %02d" % (rng.randint(0, 99), rng.randint(0, 99))
     return "+41 %s 000 %02d %02d" % (rng.choice(["21", "22", "24", "26", "27", "31", "32", "44", "61", "71"]),
@@ -327,15 +327,15 @@ def phone_ch(rng: random.Random, mobile: bool) -> str:
 
 
 def phone_fr_fiction(rng: random.Random) -> str:
-    # Tranche réservée par l'ARCEP aux œuvres de fiction : 06 39 98 xx xx
+    # Range reserved by ARCEP for works of fiction: 06 39 98 xx xx
     return "+33 6 39 98 %02d %02d" % (rng.randint(0, 99), rng.randint(0, 99))
 
 
 # ----------------------------------------------------------------------------
-# Entités
+# Entities
 # ----------------------------------------------------------------------------
 class Person(dict):
-    """dict avec accès attribut."""
+    """dict with attribute access."""
     def __getattr__(self, k):
         try:
             return self[k]
@@ -400,7 +400,7 @@ def build_entities(seed: int, n_patients: int = 64, n_physicians: int = 8, n_sta
                 return i
 
     def make_address():
-        """Adresse originale + pseudo-adresse dérivée de façon DÉTERMINISTE (même valeur -> même substitution)."""
+        """Original address + pseudo-address derived DETERMINISTICALLY (same value -> same substitution)."""
         si = rng.randrange(len(STREETS_ORIG))
         num = rng.randint(1, 120)
         ci = rng.randrange(len(CITIES))
@@ -468,7 +468,7 @@ def build_entities(seed: int, n_patients: int = 64, n_physicians: int = 8, n_sta
         persons.append(p)
         return p
 
-    # Persona pivot demandée : Eduard Weber -> Franz Keller (cohérence inter-documents)
+    # Requested pivot persona: Eduard Weber -> Franz Keller (cross-document consistency)
     weber = make_person("patient", 1, forced={"gender": "M", "lang": "de", "first": "Eduard", "last": "Weber",
                                                  "ps_first": "Franz", "ps_last": "Keller", "dob": dt.date(1962, 3, 14)})
     for i in range(2, n_patients + 1):
@@ -485,7 +485,7 @@ def build_entities(seed: int, n_patients: int = 64, n_physicians: int = 8, n_sta
     staff = [p for p in persons if p.role == "staff"]
     relatives = [p for p in persons if p.role == "relative"]
 
-    # Cartes de test : 10 patients, mapping carte->carte distinct
+    # Test cards: 10 patients, distinct card->card mapping
     cards = list(TEST_CARDS)
     rng.shuffle(cards)
     ps_cards = list(TEST_CARDS_PSEUDO)
@@ -496,7 +496,7 @@ def build_entities(seed: int, n_patients: int = 64, n_physicians: int = 8, n_sta
         p["card_brand"], p["card"] = cards[i]
         p["ps_card_brand"], p["ps_card"] = ps_cards[i]
 
-    # Médecin traitant et contact d'urgence par patient
+    # Attending physician and emergency contact per patient
     for p in patients:
         p["physician"] = rng.choice(physicians).entity_id
         p["relative"] = rng.choice(relatives).entity_id
@@ -518,7 +518,7 @@ def honorific(p: Person, lang: str = "fr") -> str:
 
 
 def mapping_rows(persons):
-    """Table de pseudonymisation (entity_id, role, field, original, replacement)."""
+    """Pseudonymization table (entity_id, role, field, original, replacement)."""
     rows = []
     for p in persons:
         base = [

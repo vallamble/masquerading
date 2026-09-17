@@ -1,11 +1,11 @@
-# Service de masquerading (masquage signifiant) (POC Securiti × SharePoint).
-# - fonts-dejavu (core+extra) : familles sans/bold/mono/serif/condensed pour la réécriture d'images (OCR) ; python:3.11-slim
-#   n'embarque aucune police. fonts-liberation(2) / carlito / caladea : équivalents métriques d'Arial, Times New Roman,
-#   Courier New, Calibri, Cambria pour réécrire les PDF clients avec la même chasse (voir _pdf_font_for).
-# - tesseract fra+deu+eng (+ osd) : OCR des images, des pages scannées et du 2e filet.
-# - libreoffice-writer (sans GUI, --no-install-recommends) : RTF <-> DOCX (sanitize_rtf). Java et les autres modules
-#   (calc, impress, GTK) ne sont pas installés. Mesure de l'image : voir README (taille avant/après).
-# - curl : healthcheck.
+# Masquerading service (meaningful masking) (Securiti × SharePoint POC).
+# - fonts-dejavu (core+extra): sans/bold/mono/serif/condensed families for rewriting images (OCR); python:3.11-slim
+#   ships no font at all. fonts-liberation(2) / carlito / caladea: metric-compatible equivalents of Arial, Times New
+#   Roman, Courier New, Calibri, Cambria to rewrite client PDFs with the same advance widths (see _pdf_font_for).
+# - tesseract fra+deu+eng (+ osd): OCR of images, scanned pages and the 2nd safety net.
+# - libreoffice-writer (no GUI, --no-install-recommends): RTF <-> DOCX (sanitize_rtf). Java and the other modules
+#   (calc, impress, GTK) are not installed. Image size measurement: see README (size before/after).
+# - curl: healthcheck.
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -19,15 +19,16 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ /app/
-# Table de pseudonymes de départ (copiée vers /data au 1er démarrage si absente).
+# Initial pseudonym table (copied to /data on first start-up if absent).
 COPY seed/ /app/seed/
 
 RUN useradd -u 10001 -m masquerading
 USER 10001
-# LibreOffice écrit un profil utilisateur : chaque conversion utilise -env:UserInstallation=file:///tmp/lo_<pid>_…
-ENV SOFFICE=/usr/bin/soffice HOME=/home/masquerading
+# LibreOffice writes a user profile: each conversion uses -env:UserInstallation=file:///tmp/lo_<pid>_…
+ENV SOFFICE=/usr/bin/soffice HOME=/home/masquerading MASQUERADING_IN_CONTAINER=1
 
-# Commit de build (CI : --build-arg GIT_SHA=<sha court>) exposé par GET /healthz → on sait quelle version tourne derrière Portainer.
+# Build commit (CI: --build-arg GIT_SHA=<short sha>) exposed by GET /healthz → tells which version is running behind
+# Portainer.
 ARG GIT_SHA=dev
 ENV GIT_SHA=$GIT_SHA
 

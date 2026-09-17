@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Harnais de non-régression : moteur du SERVICE (app/sanitize_reference.py) sur le dataset POC complet,
-# évalué avec tools/evaluate_output.py. Attendu : 0 fuite / 3 717, 0 leurre / 154, 305 pages, 4 images.
+# Non-regression harness: the SERVICE engine (app/sanitize_reference.py) on the full POC dataset,
+# evaluated with tools/evaluate_output.py. Expected: 0 leaks / 3,717, 0 decoys / 154, 305 pages, 4 images.
 #
-#   DS=<…/02_Phase2_dataset> bash tools/validate.sh            # dataset existant (inbound/ + ground_truth.csv)
-#   DS=… GAP=1 bash tools/validate.sh                           # dataset d'écart (inbound_gap/ + ground_truth_gap.csv)
+#   DS=<…/02_Phase2_dataset> bash tools/validate.sh            # existing dataset (inbound/ + ground_truth.csv)
+#   DS=… GAP=1 bash tools/validate.sh                           # gap dataset (inbound_gap/ + ground_truth_gap.csv)
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 DS="${DS:?définir DS=<chemin de 02_Phase2_dataset>}"

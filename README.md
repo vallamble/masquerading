@@ -12,7 +12,7 @@ SDI scan on `Inbound` → File Insights policy → workflow → this service →
 
 | Method | Path | Body | Purpose |
 |---|---|---|---|
-| GET | `/healthz` | — | status, build commit (`version`), queue depth |
+| GET | `/healthz` | — | status, build commit (`version`), queue depth, counters (no file names) |
 | POST | `/sanitize` | `{"file_path":"…"}` **or** `{"alert":{…}}` | pseudonymize one file (202, async) |
 | POST | `/scan-completed` | `{"scan_id":"…"}` (or `{"scan":{…}}`) | re-process all of `Inbound` (202) |
 
@@ -36,6 +36,8 @@ schema). POST requests require the `X-Api-Key: $SERVICE_API_KEY` header.
 | `COVER_UNREAD_INK` | `1` = auto-cover **every** ink zone OCR can't read (experimental, too aggressive on banners/frames) | `0` |
 | `SCAN_DPI` | render resolution for scanned PDF pages (OCR + second pass) | `300` |
 | `SOFFICE` | path to LibreOffice `soffice` (RTF conversion) | auto-detected |
+| `HMAC_SECRET` | key of the HMAC that derives pseudonyms for values absent from the table (`generated.json`); falls back to `SERVICE_API_KEY`, then to a demo constant with a start-up warning — set it in production so generated pseudonyms cannot be recomputed from the public code | — |
+| `MAPPING_PUBLIC` | `1` = serve `GET /mapping` (the original → pseudonym table, i.e. the re-identification key) without the API key — lab demos only, never in production | `0` |
 | `MATCH_INPUT_SIZE` | `1` = make every output file byte-identical in size to its input (neutral padding, see Status) ; `0` = natural size | `1` |
 | `PDF_SUBSET_FONTS` | `1` = subset the TrueType faces re-inserted in PDFs | `1` |
 
@@ -48,6 +50,14 @@ Persistent state: `${DATA_DIR}/mapping_by_value.csv` (pseudonym table; seed copi
 start if missing) and `${DATA_DIR}/generated.json` (unknown values, deterministic derivation).
 The service starts **without** Graph credentials (returns 202 and logs); the Graph call only
 fails inside the worker at processing time.
+
+## Security
+
+- Every `POST` and `GET /mapping` require `X-Api-Key`, compared in constant time; `GET /healthz` is public and exposes no file name.
+- File paths coming from the alert payload are reduced to a path relative to `Inbound`, then rejected if they contain `..`, empty segments or an unsupported extension — the service can only read `Inbound/…` and write `Output/…`.
+- Request logs record the payload's keys and the resolved path, never its contents (a Securiti alert may carry personal data). Secrets come from `<VAR>_FILE` / `/run/secrets`, never from the compose file.
+- The pseudonym table (`/data/mapping_by_value.csv`, `generated.json`) is the re-identification key: it lives on the service volume only; the `/mapping` page that shows it is behind the API key unless `MAPPING_PUBLIC=1`.
+- Outputs are written under the same relative path in `Output`; the neutral padding used for size matching never carries data (zeros, spaces, or random bytes).
 
 ## Supported formats
 
@@ -125,6 +135,14 @@ docker stack deploy -c docker-compose.yml masquerading   # or deploy via Portain
 | End-to-end through SharePoint and the deployed service (17.09, `bd3f1a4`) | POC dataset 9 files → `Documents/Inbound/e2e-base` → `POST /sanitize` → `Documents/Output/e2e-base` → same evaluation as local: **0 leaks / 3 717**, 305 pages / 4 images. Gap dataset 11 files → `e2e-gap`: **0 / 372**, signatures 3/3, decoys 6/6. Graph client now retries timeouts and 429/5xx (a 300 s ReadTimeout broke the first gap run) |
 | Deployed build | `GET /healthz` returns `version` = short commit SHA baked at build time (`GIT_SHA`), so the running image can be checked after each Portainer *Pull and redeploy* |
 
+Known limits found by the 2026-09-18 code review, not covered by the two datasets and left as is (documented, not fixed):
+DOCX text inside text boxes, footnotes/endnotes, comments, content controls and tracked changes is not traversed;
+XLSX numeric cells (a card number typed as a number), cell comments, sheet names and `xl/media` images are not scanned;
+vector artwork in the bottom third of a PDF page (a footer logo made of curves) can be taken for a vector signature and
+removed; `.docm` is not handled. Fixed in the same review: identical embedded objects repeated in one file are now all
+sanitized (the anti-loop guard returned the original bytes for the second copy), an OCR failure now fails the file instead
+of writing it back unchanged, EXIF orientation is honoured before OCR, a PDF image shared by many pages is processed once.
+
 Known limits, logged for review rather than processed: OLE `.bin` objects that are not Office packages, EMF/WMF previews
 of embedded objects (Word-generated), a signature drawn over text (the text under it is erased too), native RTF patching
 (LibreOffice round trip is used instead). Signature thresholds were tuned on synthetic strokes; check them on real
@@ -163,8 +181,9 @@ SKIP_SANITIZE=1 RUN_DIR=tools/runs/e2e_base bash tools/validate.sh
 
 ## Demo state
 
-`Documents/Inbound` holds exactly the two fictional datasets: the POC files at the root (with `images/`) and the gap
-files under `gap/`. `Documents/Output` mirrors that tree with the pseudonymized files produced by the current build.
+`Documents/Inbound` holds exactly the two fictional datasets, flat: the 4 POC documents and the 11 gap files at the
+root, the 5 POC images under `images/`. `Documents/Output` mirrors that tree with the pseudonymized files produced by
+the current build.
 Securiti workflows do not fire in the lab tenant, so the trigger is manual: `POST /sanitize` for one file or
 `POST /scan-completed` to reprocess all of Inbound. To rebuild that state from scratch (wipes both folders first):
 

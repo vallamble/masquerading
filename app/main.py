@@ -1,23 +1,24 @@
-"""Service de masquerading (masquage signifiant) — POC Securiti × SharePoint.
+"""Masquerading service (meaningful masking) — Securiti × SharePoint POC.
 
-Reçoit les déclenchements des Workflows Securiti (nœud HTTP Request, exécuté
-depuis le cloud Securiti) et pseudonymise les fichiers de Documents/Inbound
-vers Documents/Output, de façon cohérente (Eduard→Franz partout, IBAN valides,
-images réécrites par OCR). Le traitement est asynchrone (202 + worker) : le
-PDF de 305 pages + OCR prend plusieurs minutes, bien au-delà du timeout d'un
-nœud HTTP Request.
+Receives the triggers from Securiti Workflows (HTTP Request node, executed
+from the Securiti cloud) and pseudonymizes the files of Documents/Inbound
+into Documents/Output, consistently (Eduard→Franz everywhere, valid IBANs,
+images rewritten via OCR). Processing is asynchronous (202 + worker): the
+305-page PDF + OCR takes several minutes, far beyond the timeout of an
+HTTP Request node.
 
-Endpoints :
-  POST /sanitize        {"file_path": "Inbound/x.docx"}  — un fichier
-  POST /scan-completed  {"scan_id": "..."}               — tout Inbound
+Endpoints:
+  POST /sanitize        {"file_path": "Inbound/x.docx"}  — one file
+  POST /scan-completed  {"scan_id": "..."}               — all of Inbound
   GET  /healthz
-  GET  /mapping         table de correspondance original→pseudonyme (HTML, ?format=json)
+  GET  /mapping         original→pseudonym mapping table (HTML, ?format=json)
 
-Auth : header X-Api-Key == $SERVICE_API_KEY (les POST seulement).
-État : /data (PVC) — table de pseudonymes persistante (mapping_by_value.csv
-copiée au premier démarrage + generated.json pour les valeurs HMAC inconnues).
+Auth: header X-Api-Key == $SERVICE_API_KEY (POST requests only).
+State: /data (PVC) — persistent pseudonym table (mapping_by_value.csv
+copied on first start + generated.json for the unknown HMAC-derived values).
 """
 import csv
+import hmac
 import html
 import json
 import logging
@@ -44,7 +45,7 @@ GENERATED = os.path.join(DATA_DIR, "generated.json")
 SEED_MAPPING = os.environ.get("SEED_MAPPING", "/app/seed/mapping_by_value.csv")
 INBOUND = os.environ.get("INBOUND_PREFIX", "Inbound")
 OUTPUT = os.environ.get("OUTPUT_PREFIX", "Output")
-API_KEY = secret("SERVICE_API_KEY", default="")   # env, SERVICE_API_KEY_FILE ou /run/secrets/SERVICE_API_KEY
+API_KEY = secret("SERVICE_API_KEY", default="")   # env, SERVICE_API_KEY_FILE or /run/secrets/SERVICE_API_KEY
 
 app = FastAPI(title="masquerading", version="0.1.0")
 jobs: "queue.Queue[dict]" = queue.Queue()
@@ -52,8 +53,8 @@ state = {"processed": 0, "errors": 0, "last": None}
 
 
 def _merge_seed_into_mapping():
-    """La table persistée (/data) est complétée par les lignes du seed qu'elle n'a pas encore : une valeur ajoutée au
-    seed dans le code (ex. FIRST_NAME Anne) s'applique après redéploiement sans toucher au volume."""
+    """The persisted table (/data) is completed with the seed rows it does not have yet: a value added to the
+    seed in the code (e.g. FIRST_NAME Anne) applies after redeployment without touching the volume."""
     if not os.path.exists(MAPPING):
         os.makedirs(DATA_DIR, exist_ok=True)
         shutil.copy(SEED_MAPPING, MAPPING)
@@ -67,7 +68,7 @@ def _merge_seed_into_mapping():
             w = csv.DictWriter(f, fieldnames=["data_type", "original_value", "replacement_value"])
             for r in new:
                 w.writerow({k: r[k] for k in w.fieldnames})
-        log.info("table de pseudonymes : %d ligne(s) du seed ajoutée(s)", len(new))
+        log.info("pseudonym table: %d seed row(s) added", len(new))
 
 
 def _pseudonymizer():
@@ -84,7 +85,7 @@ def _persist_generated(pz):
         json.dump(pz.generated, f, ensure_ascii=False, indent=1)
 
 
-# Formats acceptés par l'API (toute autre extension est ignorée et journalisée).
+# Formats accepted by the API (any other extension is ignored and logged).
 HANDLERS = {
     ".docx": sr.sanitize_docx, ".xlsx": sr.sanitize_xlsx, ".pdf": sr.sanitize_pdf, ".rtf": sr.sanitize_rtf,
     ".png": sr.sanitize_image_file, ".jpg": sr.sanitize_image_file, ".jpeg": sr.sanitize_image_file,
@@ -93,8 +94,8 @@ SUPPORTED_FORMATS = sorted(HANDLERS)
 
 
 def _stored_size(gc: GraphClient, path: str, uploaded: int, tries: int = 6, pause: float = 2.5):
-    """Taille de drive:/<path> telle que stockée par SharePoint. La réécriture d'un DOCX/XLSX est asynchrone : on relit
-    jusqu'à ce que la taille diffère de celle envoyée (ou ~15 s), puis on la considère stable."""
+    """Size of drive:/<path> as stored by SharePoint. The rewrite of a DOCX/XLSX is asynchronous: we re-read
+    until the size differs from the one uploaded (or ~15 s), then consider it stable."""
     size = None
     for _ in range(tries):
         time.sleep(pause)
@@ -108,36 +109,39 @@ def _stored_size(gc: GraphClient, path: str, uploaded: int, tries: int = 6, paus
 
 
 def _sanitize_one(gc: GraphClient, pz, rel_path: str):
-    """rel_path est relatif à INBOUND (ex. 'images/x.png')."""
+    """rel_path is relative to INBOUND (e.g. 'images/x.png')."""
     ext = os.path.splitext(rel_path)[1].lower()
     handler = HANDLERS.get(ext)
     if handler is None:
-        log.info("ignoré (extension non gérée): %s", rel_path)
+        log.info("ignored (unsupported extension): %s", rel_path)
         return {"skipped": ext}
     with tempfile.TemporaryDirectory() as td:
         src = os.path.join(td, "in" + ext)
         dst = os.path.join(td, "out" + ext)
         gc.download(f"{INBOUND}/{rel_path}", src)
         summary = handler(src, dst, pz, strict=False)
-        match = os.environ.get("MATCH_INPUT_SIZE", "1") == "1"   # exigence 7 : même taille de fichier (bourrage neutre)
+        match = os.environ.get("MATCH_INPUT_SIZE", "1") == "1"   # requirement 7: same file size (neutral padding)
         raw = dst + ".raw"
         if match:
             shutil.copyfile(dst, raw)
             summary["size_match"] = sr.match_input_size(src, dst)
         gc.upload(f"{OUTPUT}/{rel_path}", dst)
-        # SharePoint réécrit les DOCX/XLSX qu'il stocke (métadonnées de bibliothèque : +901 o sur nos DOCX, +8,5 Ko sur
-        # le XLSX), de façon ASYNCHRONE : la réponse de l'envoi donne encore notre taille. On relit la taille stockée
-        # quelques secondes plus tard et, si elle diffère de l'entrée, on re-bourre à (entrée − écart) et on renvoie
-        # (trois essais au plus). Journal : size_match.sharepoint.
+        # SharePoint rewrites the DOCX/XLSX it stores (library metadata: +901 B on our DOCX, +8.5 KB on
+        # the XLSX), ASYNCHRONOUSLY: the upload response still reports our size. We re-read the stored size
+        # a few seconds later and, if it differs from the input, re-pad to (input − delta) and re-upload
+        # (three attempts at most). Log: size_match.sharepoint.
         si = os.path.getsize(src)
         if match and summary["size_match"].get("method") and ext in (".docx", ".xlsx"):
             stored = _stored_size(gc, f"{OUTPUT}/{rel_path}", os.path.getsize(dst))
             for _attempt in range(3):
-                if stored is None or stored == si:
+                if stored is None or stored <= si:          # SharePoint only ever adds bytes; unknown or smaller: stop
                     break
                 target = si - (stored - si)
+                prev = dst + ".prev"; shutil.copyfile(dst, prev)
                 shutil.copyfile(raw, dst)
                 sm2 = sr.match_input_size(src, dst, target=target)
+                if not sm2.get("method"):                    # could not pad to the new target: keep the previous version
+                    shutil.copyfile(prev, dst); break
                 gc.upload(f"{OUTPUT}/{rel_path}", dst)
                 new_stored = _stored_size(gc, f"{OUTPUT}/{rel_path}", os.path.getsize(dst))
                 summary["size_match"].setdefault("sharepoint", []).append(
@@ -145,19 +149,19 @@ def _sanitize_one(gc: GraphClient, pz, rel_path: str):
                      "method": sm2.get("method") or sm2.get("unmatched")})
                 stored = new_stored
     _persist_generated(pz)
-    log.info("traité %s -> %s : %s", rel_path, OUTPUT, summary)
+    log.info("processed %s -> %s : %s", rel_path, OUTPUT, summary)
     return summary
 
 
 def worker():
-    # init paresseuse : /healthz doit répondre même sans credentials Graph posés,
-    # et une erreur d'env ne doit pas tuer le thread au boot.
+    # lazy init: /healthz must respond even without Graph credentials set,
+    # and an env error must not kill the thread at boot.
     gc = pz = None
     while True:
         job = jobs.get()
         try:
-            if gc is None:
-                gc = GraphClient()
+            if gc is None or pz is None:
+                gc = gc or GraphClient()
                 pz = _pseudonymizer()
             if job["kind"] == "file":
                 rel = job["path"]
@@ -171,11 +175,11 @@ def worker():
                         _sanitize_one(gc, pz, rel)
                         state["processed"] += 1
                     except Exception:
-                        log.exception("échec sur %s", rel)
+                        log.exception("failed on %s", rel)
                         state["errors"] += 1
             state["last"] = job
         except Exception:
-            log.exception("échec du job %s", job)
+            log.exception("job failed %s", job)
             state["errors"] += 1
         finally:
             jobs.task_done()
@@ -185,19 +189,32 @@ threading.Thread(target=worker, daemon=True).start()
 
 
 def _auth(x_api_key):
-    if not API_KEY or x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="X-Api-Key invalide")
+    """Mandatory API key, compared in constant time (no leak through the response time)."""
+    if not API_KEY or not hmac.compare_digest(x_api_key or "", API_KEY):
+        raise HTTPException(status_code=401, detail="invalid X-Api-Key")
 
 
-# Champs candidats pour retrouver le chemin d'un fichier dans un payload d'alerte
-# Securiti (le schéma du Policy Alert n'est pas documenté — T1). On sonde du plus
-# précis au plus large. Le chemin renvoyé est ramené à un chemin relatif à INBOUND.
+def _safe_rel(rel):
+    """Accepted path relative to Inbound: non-empty segments, no ".." nor absolute path, supported extension.
+    Prevents a forged path from making the service read/write a file outside the Inbound/Output folder."""
+    rel = (rel or "").replace("\\", "/").strip("/")
+    parts = rel.split("/")
+    if not rel or any(p in ("", ".", "..") for p in parts):
+        raise HTTPException(status_code=422, detail="invalid file path")
+    if os.path.splitext(rel)[1].lower() not in HANDLERS:
+        raise HTTPException(status_code=422, detail="unsupported extension: %s" % os.path.splitext(rel)[1])
+    return rel
+
+
+# Candidate fields to find the path of a file in a Securiti alert payload
+# (the Policy Alert schema is not documented — T1). Probed from the most
+# specific to the broadest. The returned path is reduced to a path relative to INBOUND.
 _PATH_KEYS = ("file_path", "resource_path", "resourcePath", "prefix_path",
               "object_path", "path", "full_path", "file_name", "displayName")
 
 
 def _extract_path(obj):
-    """Trouve récursivement un chemin de fichier plausible dans un dict/list."""
+    """Recursively finds a plausible file path in a dict/list."""
     if isinstance(obj, str):
         return obj if "/" in obj or "." in obj else None
     if isinstance(obj, dict):
@@ -217,17 +234,17 @@ def _extract_path(obj):
 
 
 def _to_inbound_rel(path):
-    """Ramène un chemin absolu SharePoint/Graph à un chemin relatif à INBOUND."""
+    """Reduces an absolute SharePoint/Graph path to a path relative to INBOUND."""
     marker = f"/{INBOUND}/"
     if marker in path:
         return path.split(marker, 1)[1]
     if path.startswith(INBOUND + "/"):
         return path[len(INBOUND) + 1:]
-    return path.rsplit("/", 1)[-1]  # dernier recours : le nom de fichier
+    return path.rsplit("/", 1)[-1]  # last resort: the file name
 
 
 class SanitizeReq(BaseModel):
-    # file_path direct (test manuel) OU alert = payload brut du Policy Alert Securiti.
+    # direct file_path (manual test) OR alert = raw payload of the Securiti Policy Alert.
     file_path: str | None = None
     alert: dict | list | None = None
 
@@ -243,13 +260,16 @@ class ScanReq(BaseModel):
 
 @app.get("/healthz")
 def healthz():
+    pub = dict(state)
+    if isinstance(pub.get("last"), dict):          # no file name on a public endpoint (may name a patient)
+        pub["last"] = {k: v for k, v in pub["last"].items() if k != "path"}
     return {"status": "ok", "version": os.environ.get("GIT_SHA", "dev"), "queue": jobs.qsize(),
-            "formats": SUPPORTED_FORMATS, **state}
+            "formats": SUPPORTED_FORMATS, **pub}
 
 
 def _load_mapping():
-    """Lit la table de pseudonymes (CSV persistant + generated.json runtime).
-    Retourne une liste de (data_type, original, pseudonyme, source)."""
+    """Reads the pseudonym table (persistent CSV + runtime generated.json).
+    Returns a list of (data_type, original, pseudonym, source)."""
     rows = []
     seen = set()
     path = MAPPING if os.path.exists(MAPPING) else SEED_MAPPING
@@ -271,8 +291,11 @@ def _load_mapping():
 
 
 @app.get("/mapping", response_class=HTMLResponse)
-def mapping(format: str = "html"):
-    """Publie la table de correspondance masquage original → pseudonyme (lab, sans auth)."""
+def mapping(format: str = "html", x_api_key: str = Header(default="")):
+    """Original → pseudonym mapping table: it enables RE-IDENTIFICATION, hence a mandatory API key
+    (X-Api-Key header); MAPPING_PUBLIC=1 makes it public for a lab demo, never in production."""
+    if os.environ.get("MAPPING_PUBLIC", "0") != "1":
+        _auth(x_api_key)
     rows = _load_mapping()
     if format == "json":
         return JSONResponse([
@@ -309,16 +332,17 @@ def mapping(format: str = "html"):
 @app.post("/sanitize", status_code=202)
 def sanitize(req: SanitizeReq, x_api_key: str = Header(default="")):
     _auth(x_api_key)
-    # Log du payload brut : capture le schéma d'alerte (T1) au premier tir réel.
-    log.info("POST /sanitize payload: %s", req.model_dump())
+    # Log WITHOUT the payload content (a Securiti alert may carry personal values): keys + path.
+    log.info("POST /sanitize keys=%s", sorted(req.model_dump(exclude_none=True).keys()))
     path = req.file_path
     if not path and req.alert is not None:
         path = _extract_path(req.alert)
     if not path:
         path = _extract_path(req.model_dump())
     if not path:
-        raise HTTPException(status_code=422, detail="aucun chemin de fichier trouvé dans le payload")
-    rel = _to_inbound_rel(path)
+        raise HTTPException(status_code=422, detail="no file path found in the payload")
+    rel = _safe_rel(_to_inbound_rel(path))
+    log.info("POST /sanitize -> %s", rel)
     jobs.put({"kind": "file", "path": rel})
     return {"queued": rel, "queue": jobs.qsize()}
 
