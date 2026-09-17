@@ -128,6 +128,10 @@ class GraphClient:
         walk(path, "")
         return out
 
+    def item(self, path):
+        """Métadonnées de drive:/<path> (dont `size` telle que STOCKÉE par SharePoint)."""
+        return self._get(f"{GRAPH}/drives/{self.drive_id()}/root:/{path}").json()
+
     def delete(self, path):
         """Supprime drive:/<path> (fichier ou dossier, récursif côté Graph). 404 = déjà absent, ignoré."""
         r = requests.delete(f"{GRAPH}/drives/{self.drive_id()}/root:/{path}", headers=self._h(), timeout=60)
