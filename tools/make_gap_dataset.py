@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-make_gap_dataset.py — Dataset d'ÉCART (100 % fictif) pour les exigences Novartis non couvertes :
-  A. RTF                      -> Lettre_FICTIF.rtf (DOCX python-docx -> LibreOffice -> RTF)
-  B. PDF scanné               -> Rapport_scan_FICTIF.pdf (4 pages image 200 dpi, skew, bruit, JPEG q75, une page /Rotate 90)
-  C. documents imbriqués      -> Contrat_imbrique_FICTIF.docx (XLSX en objet OLE word/embeddings + aperçu PNG en clair)
-                                 Annexe_jointe_FICTIF.pdf (pièce jointe XLSX via embfile_add)
-  D. signatures manuscrites   -> Formulaire_signe_FICTIF.pdf (p.1 paraphe raster, p.2 paraphe vectoriel) + formulaire_signe_FICTIF.png
+make_gap_dataset.py — GAP dataset (100 % fictitious) for the Novartis requirements not yet covered:
+  A. RTF                      -> Lettre_FICTIF.rtf (python-docx DOCX -> LibreOffice -> RTF)
+  B. scanned PDF              -> Rapport_scan_FICTIF.pdf (4 image pages at 200 dpi, skew, noise, JPEG q75,
+                                 one page with /Rotate 90)
+  C. embedded documents       -> Contrat_imbrique_FICTIF.docx (XLSX as an OLE object in word/embeddings + clear-text
+                                 PNG preview)
+                                 Annexe_jointe_FICTIF.pdf (XLSX attachment via embfile_add)
+  D. handwritten signatures   -> Formulaire_signe_FICTIF.pdf (p.1 raster initials, p.2 vector initials)
+                                 + formulaire_signe_FICTIF.png
 
-Écrit UNIQUEMENT dans <DS>/inbound_gap/ et <DS>/ground_truth/{ground_truth_gap,signatures_gap,decoys_gap}.csv.
-Les valeurs viennent de ground_truth.csv / mapping_by_value.csv (mêmes pseudonymes que le reste du dataset).
+Writes ONLY to <DS>/inbound_gap/ and <DS>/ground_truth/{ground_truth_gap,signatures_gap,decoys_gap}.csv.
+The values come from ground_truth.csv / mapping_by_value.csv (same pseudonyms as the rest of the dataset).
 
     python tools/make_gap_dataset.py --ds <…/02_Phase2_dataset> [--soffice /Applications/LibreOffice.app/Contents/MacOS/soffice]
 """
@@ -16,12 +19,10 @@ import argparse
 import collections
 import csv
 import io
-import math
 import os
 import random
 import shutil
 import subprocess
-import sys
 import tempfile
 import zipfile
 
@@ -49,7 +50,7 @@ def font(size):
 
 # ---------------------------------------------------------------------------------------------------------------------
 class GT:
-    """Accumule les lignes de vérité terrain, de leurres et de boîtes de signature."""
+    """Accumulates the ground-truth rows, the decoys and the signature boxes."""
 
     def __init__(self, entities):
         self.rows, self.decoys, self.sigs = [], [], []
@@ -93,10 +94,10 @@ def full_name(ents, eid):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# B. PDF scanné
+# B. scanned PDF
 # ---------------------------------------------------------------------------------------------------------------------
 def degrade(img, rng, angle):
-    """Rotation légère (fond blanc), flou, bruit gaussien, JPEG q75 -> octets."""
+    """Slight rotation (white background), blur, Gaussian noise, JPEG q75 -> bytes."""
     img = img.convert("RGB").rotate(angle, resample=Image.BICUBIC, expand=False, fillcolor=(255, 255, 255))
     img = img.filter(ImageFilter.GaussianBlur(0.6))
     a = np.asarray(img).astype(np.int16)
@@ -111,10 +112,10 @@ def make_scanned_pdf(ds, out_dir, gt, rows, rng):
     byp = collections.defaultdict(list)
     for r in pdf_rows:
         byp[int(r["page"])].append(r)
-    # meilleure page « courrier » (section letter_*)
+    # best "letter" page (section letter_*)
     letter = max((p for p in byp if byp[p][0]["section"].startswith("letter")),
                  key=lambda p: sum(r["expected_action"] == "PSEUDONYMIZE" for r in byp[p]))
-    pages = [65, 153, letter, 178]           # admin (12 types), facturation (IBAN/cartes), courrier (/Rotate 90), annuaire (dense)
+    pages = [65, 153, letter, 178]           # admin (12 types), billing (IBAN/cards), letter (/Rotate 90), directory (dense)
     angles = [1.2, -0.7, 0.9, -1.4]
     doc = fitz.open()
     name = "Rapport_scan_FICTIF.pdf"
@@ -124,8 +125,8 @@ def make_scanned_pdf(ds, out_dir, gt, rows, rng):
         img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
         w_pt, h_pt = sp.rect.width, sp.rect.height
         if i == 2:
-            # page stockée en paysage avec le contenu tourné, /Rotate 90 pour l'affichage (cas fréquent des scanners)
-            img = img.rotate(90, expand=True)          # PIL : anti-horaire ; /Rotate 90 (horaire à l'affichage) la redresse
+            # page stored in landscape with rotated content, /Rotate 90 for display (common case with scanners)
+            img = img.rotate(90, expand=True)          # PIL: counter-clockwise; /Rotate 90 (clockwise on display) straightens it
             w_pt, h_pt = h_pt, w_pt
         data, _ = degrade(img, rng, ang)
         page = doc.new_page(width=w_pt, height=h_pt)
@@ -204,7 +205,7 @@ def soffice_convert(soffice, src, fmt, outdir, filter_name=None):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# C. imbriqués : classeur, aperçu, DOCX+OLE, PDF+pièce jointe
+# C. embedded: workbook, preview, DOCX+OLE, PDF+attachment
 # ---------------------------------------------------------------------------------------------------------------------
 def make_patient_xlsx(ents, gt, path, host_doc, host_loc, eids):
     from openpyxl import Workbook
@@ -215,7 +216,7 @@ def make_patient_xlsx(ents, gt, path, host_doc, host_loc, eids):
         ws.append([e["LAST_NAME"][0], e["FIRST_NAME"][0], e["AHV_NUMBER"][0], e["IBAN"][0]])
         for col, t in zip("ABCD", ("LAST_NAME", "FIRST_NAME", "AHV_NUMBER", "IBAN")):
             gt.add(host_doc, host_loc, t, e[t][0], eid, sheet="Patients", cell="%s%d" % (col, i), variant="embedded_xlsx")
-    ws.append(["Contrôle", "—", "756.1234.5678.90", "CH53 8555 2479 4873 5989 5"])   # leurres (checksums faux)
+    ws.append(["Contrôle", "—", "756.1234.5678.90", "CH53 8555 2479 4873 5989 5"])   # decoys (wrong checksums)
     gt.decoy(host_doc, "AHV_INVALID", "756.1234.5678.90", "AVS à checksum faux dans le classeur imbriqué", sheet="Patients", cell="C%d" % (len(eids) + 2))
     gt.decoy(host_doc, "IBAN_INVALID", "CH53 8555 2479 4873 5989 5", "IBAN à checksum faux dans le classeur imbriqué", sheet="Patients", cell="D%d" % (len(eids) + 2))
     for col, w in zip("ABCD", (18, 16, 20, 30)):
@@ -224,7 +225,7 @@ def make_patient_xlsx(ents, gt, path, host_doc, host_loc, eids):
 
 
 def render_table_preview(ents, eids, path):
-    """Aperçu façon Word de l'objet Excel : les valeurs en clair dans une image (word/media) — c'est le piège."""
+    """Word-style preview of the Excel object: the values in clear text inside an image (word/media) — the trap."""
     rows = [("Nom", "Prénom", "AVS", "IBAN")] + [(ents[e]["LAST_NAME"][0], ents[e]["FIRST_NAME"][0], ents[e]["AHV_NUMBER"][0], ents[e]["IBAN"][0]) for e in eids]
     f = font(22); fb = font(22)
     colw = [220, 200, 260, 380]; rh = 40
@@ -285,7 +286,7 @@ def make_embedded_docx(ents, gt, out_dir, tmp):
             data = zin.read(item.filename)
             if item.filename == "word/document.xml":
                 s = data.decode("utf-8")
-                # remplacer le run du placeholder par le run <w:object>
+                # replace the placeholder run with the <w:object> run
                 import re
                 pat = re.compile(r"<w:r>(?:(?!</w:r>).)*?\[\[OLE_PLACEHOLDER\]\](?:(?!</w:r>).)*?</w:r>", re.S)
                 assert pat.search(s), "placeholder introuvable"
@@ -336,7 +337,7 @@ def make_attached_pdf(ents, gt, out_dir, xlsx_src, tmp):
 # D. signatures
 # ---------------------------------------------------------------------------------------------------------------------
 def signature_curves(rng, n_seg=7):
-    """Paraphe synthétique : suite de Béziers cubiques dans la boîte unité [0,1]x[0,1] + un trait de soulignement."""
+    """Synthetic initials: a sequence of cubic Béziers in the unit box [0,1]x[0,1] + an underline stroke."""
     segs = []
     x, y = 0.02, 0.55
     step = 0.9 / n_seg
@@ -347,7 +348,7 @@ def signature_curves(rng, n_seg=7):
         c2 = (x + step * rng.uniform(0.5, 0.9), min(1.0, max(0.0, ny + rng.uniform(-0.9, 0.9))))
         segs.append(((x, y), c1, c2, (nx, ny)))
         x, y = nx, ny
-    # trait final (paraphe souligné)
+    # final stroke (underlined initials)
     segs.append(((0.05, 0.85), (0.4, 0.98), (0.6, 0.72), (0.95, 0.9)))
     return segs
 
@@ -358,7 +359,7 @@ def bezier_pts(p0, p1, p2, p3, n=40):
 
 
 def raster_signature(segs, w, h, stroke=2.5, ink=(20, 25, 90)):
-    """Image RGB fond blanc w×h avec le paraphe (anti-aliasé via rendu 4×)."""
+    """White-background RGB image w×h with the initials (anti-aliased through 4× rendering)."""
     S = 4
     img = Image.new("RGB", (w * S, h * S), (255, 255, 255)); dr = ImageDraw.Draw(img)
     for p0, c1, c2, p3 in segs:
@@ -368,8 +369,8 @@ def raster_signature(segs, w, h, stroke=2.5, ink=(20, 25, 90)):
 
 
 def form_page(doc, ents, gt, name, pno, rng, vector):
-    """Page A4 : formulaire avec valeurs tapées, libellé « Signature : », paraphe (raster ou vectoriel), nom tapé dessous,
-    bloc « Digitally signed by », un cadre et une ligne de séparation ailleurs (leurres graphiques)."""
+    """A4 page: form with typed values, "Signature :" label, initials (raster or vector), typed name below,
+    "Digitally signed by" block, a frame and a separator line elsewhere (graphic decoys)."""
     P = "P001"; e = ents[P]; nm = full_name(ents, P)
     page = doc.new_page(width=595, height=842)
     page.insert_text((60, 70), "Formulaire de consentement — étude FICTIVE (page %d)" % pno, fontsize=15, fontname="hebo")
@@ -378,13 +379,13 @@ def form_page(doc, ents, gt, name, pno, rng, vector):
                      ("N° patient", e["PATIENT_ID"][0]), ("Téléphone", e["PHONE"][0])):
         page.insert_text((60, y), lab + " :", fontsize=11); page.insert_text((220, y), val, fontsize=11); y += 22
     gt.add_person(name, "text", P, ["FIRST_NAME", "LAST_NAME", "DATE_OF_BIRTH", "AHV_NUMBER", "PATIENT_ID", "PHONE"], page=str(pno), section="fields")
-    # leurre 1 : cadre (encadré d'information) — NE DOIT PAS être recouvert
+    # decoy 1: frame (information box) — MUST NOT be covered
     frame = fitz.Rect(60, 250, 535, 330)
     page.draw_rect(frame, color=(0.1, 0.1, 0.1), width=1.2)
     page.insert_textbox(fitz.Rect(70, 258, 525, 325), "Information au participant : ce document est entièrement fictif. Il sert à valider "
                         "le masquage des signatures manuscrites sans altérer les cadres et les filets de mise en page.", fontsize=10)
     gt.sig(name, pno, tuple(frame), "decoy_frame", "pt")
-    # leurre 2 : ligne de séparation
+    # decoy 2: separator line
     page.draw_line((60, 360), (535, 360), color=(0.1, 0.1, 0.1), width=1.0)
     gt.sig(name, pno, (60, 358, 535, 362), "decoy_line", "pt")
     page.insert_text((60, 385), "Le participant confirme avoir lu et compris l'information ci-dessus.", fontsize=10)
@@ -401,7 +402,7 @@ def form_page(doc, ents, gt, name, pno, rng, vector):
         buf = io.BytesIO(); img.save(buf, "PNG")
         page.insert_image(box, stream=buf.getvalue())
     gt.sig(name, pno, tuple(box), "signature_vector" if vector else "signature_raster", "pt")
-    page.insert_text((150, 662), nm, fontsize=10)                      # nom tapé sous le paraphe
+    page.insert_text((150, 662), nm, fontsize=10)                      # typed name under the initials
     page.insert_text((150, 676), "Digitally signed by %s, 12.03.2026" % nm, fontsize=9, color=(0.3, 0.3, 0.3))
     gt.add_person(name, "text", P, ["FIRST_NAME", "LAST_NAME"], page=str(pno), section="typed_name", variant="typed_under_signature")
     gt.add_person(name, "text", P, ["FIRST_NAME", "LAST_NAME"], page=str(pno), section="digital_signature", variant="digitally_signed_by")
@@ -415,7 +416,7 @@ def make_signed_form(ents, gt, out_dir, rng):
     p1, box1, frame1 = form_page(doc, ents, gt, name, 1, rng, vector=False)
     form_page(doc, ents, gt, name, 2, rng, vector=True)
     doc.save(os.path.join(out_dir, name), deflate=True)
-    # variante image : rendu 200 dpi de la page 1 (boîtes en pixels)
+    # image variant: 200 dpi render of page 1 (boxes in pixels)
     png = "formulaire_signe_FICTIF.png"
     pix = doc[0].get_pixmap(dpi=200)
     img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
@@ -430,11 +431,12 @@ def make_signed_form(ents, gt, out_dir, rng):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Niveau 2 : tests dédiés pour ce qui n'était validé que par lecture du code
-#   #3 cohérence texte / tableau / en-tête-pied / image  -> Coherence_FICTIF.docx
-#   #4 PII uniquement en en-tête / pied, 4 pages          -> Pied_de_page_FICTIF.docx + Pied_de_page_FICTIF.pdf
-#   #1 templates variables                                 -> Template_B_FICTIF.docx (fiche clé/valeur, MAJUSCULES, date DE,
-#                                                             IBAN sans espaces) + Template_C_FICTIF.pdf (rapport labo 2 colonnes)
+# Level 2: dedicated tests for what was only validated by reading the code
+#   #3 text / table / header-footer / image coherence     -> Coherence_FICTIF.docx
+#   #4 PII only in header / footer, 4 pages               -> Pied_de_page_FICTIF.docx + Pied_de_page_FICTIF.pdf
+#   #1 variable templates                                 -> Template_B_FICTIF.docx (key/value sheet, UPPERCASE,
+#                                                             DE date, IBAN without spaces)
+#                                                             + Template_C_FICTIF.pdf (2-column lab report)
 # ---------------------------------------------------------------------------------------------------------------------
 def _mapping_has(ds, value):
     with open(os.path.join(ds, "ground_truth/mapping_by_value.csv"), encoding="utf-8") as f:
@@ -442,7 +444,7 @@ def _mapping_has(ds, value):
 
 
 def _gt_variant(gt, document, loc, dtype, value, rep, eid, **kw):
-    """Ligne GT avec une VALEUR VARIANTE (majuscules, sans espaces, date longue) et son pseudonyme attendu."""
+    """GT row with a VARIANT VALUE (uppercase, no spaces, long date) and its expected pseudonym."""
     gt.n += 1
     gt.rows.append(dict(gt_id="GAP%05d" % gt.n, document=document, location_type=loc, page=kw.get("page", ""), sheet="", cell="",
                         paragraph=kw.get("paragraph", ""), image_file=kw.get("image_file", ""), section=kw.get("section", ""),
@@ -455,10 +457,10 @@ def make_level2(ds, ents, gt, out_dir, tmp):
     from docx import Document
     from docx.enum.section import WD_ORIENT
     from docx.enum.text import WD_BREAK
-    from docx.shared import Pt, Inches
+    from docx.shared import Inches
     P = "P001"; e = ents[P]; nm = full_name(ents, P)
 
-    # ---- #3 Coherence_FICTIF.docx : la même personne sur 5 surfaces --------------------------------------------------
+    # ---- #3 Coherence_FICTIF.docx: the same person on 5 surfaces -----------------------------------------------------
     name = "Coherence_FICTIF.docx"
     d = Document()
     sec = d.sections[0]
@@ -484,7 +486,7 @@ def make_level2(ds, ents, gt, out_dir, tmp):
     gt.add_person(name, "image", P, ["FIRST_NAME", "LAST_NAME", "AHV_NUMBER", "IBAN"], image_file="word/media/image1.png", section="image", variant="coherence_image")
     print("  %s : même personne en en-tête, pied, paragraphe, tableau et image" % name)
 
-    # ---- #4 Pied_de_page_FICTIF.docx : PII UNIQUEMENT en en-tête/pied, 4 pages ------------------------------------------
+    # ---- #4 Pied_de_page_FICTIF.docx: PII ONLY in header/footer, 4 pages ---------------------------------------------
     name = "Pied_de_page_FICTIF.docx"
     d = Document(); sec = d.sections[0]
     sec.header.paragraphs[0].text = "Confidentiel — %s" % nm
@@ -502,7 +504,7 @@ def make_level2(ds, ents, gt, out_dir, tmp):
     gt.decoy(name, "INVOICE_NUMBER", "FA-2026-10100", "n° de facture dans le corps — pas du PII")
     print("  %s : 4 pages, PII seulement en en-tête/pied" % name)
 
-    # ---- #4 Pied_de_page_FICTIF.pdf : idem en PDF natif, pied répété sur chaque page ------------------------------------
+    # ---- #4 Pied_de_page_FICTIF.pdf: same in native PDF, footer repeated on every page -------------------------------
     name = "Pied_de_page_FICTIF.pdf"
     doc = fitz.open()
     for pno in range(1, 5):
@@ -518,7 +520,7 @@ def make_level2(ds, ents, gt, out_dir, tmp):
     gt.decoy(name, "INVOICE_NUMBER", "FA-2026-10100", "n° de facture dans le corps — pas du PII")
     print("  %s : 4 pages, PII seulement en en-tête/pied" % name)
 
-    # ---- #1 Template_B_FICTIF.docx : fiche clé/valeur paysage, MAJUSCULES, date longue DE, IBAN sans espaces -------------
+    # ---- #1 Template_B_FICTIF.docx: landscape key/value sheet, UPPERCASE, long DE date, IBAN without spaces ----------
     name = "Template_B_FICTIF.docx"
     last_up, last_up_rep = e["LAST_NAME"][0].upper(), e["LAST_NAME"][1].upper()
     dob_de, dob_de_rep = "14. März 1962", "5. November 1962"
@@ -546,7 +548,7 @@ def make_level2(ds, ents, gt, out_dir, tmp):
     gt.decoy(name, "INVOICE_NUMBER", "FA-2026-10100", "n° de facture — pas du PII"); gt.decoy(name, "CONTRACT_REF", "CT-2026-0042", "référence étude — pas du PII")
     print("  %s : fiche paysage clé/valeur, MAJUSCULES, date longue DE, IBAN sans espaces" % name)
 
-    # ---- #1 Template_C_FICTIF.pdf : rapport de laboratoire deux colonnes, corps 8 pt, ordre différent --------------------
+    # ---- #1 Template_C_FICTIF.pdf: two-column laboratory report, 8 pt body, different order --------------------------
     name = "Template_C_FICTIF.pdf"
     doc = fitz.open(); page = doc.new_page(width=595, height=842)
     page.insert_text((40, 50), "LABORATOIRE CENTRAL (FICTIF) — Rapport d'analyses — Modèle C", fontsize=12, fontname="hebo")

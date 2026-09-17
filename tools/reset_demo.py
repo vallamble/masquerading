@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-reset_demo.py — remet SharePoint au propre pour la démo, puis prouve la sortie.
+reset_demo.py — resets SharePoint to a clean state for the demo, then proves the output.
 
-  1. vide <INBOUND_PREFIX> et <OUTPUT_PREFIX> (tout : anciens résultats, dossiers e2e-*, fichiers hors dataset),
-  2. dépose le dataset POC à la racine d'Inbound (sous-dossier images/ compris) et le dataset d'écart dans Inbound/gap/,
-  3. POST /scan-completed : le service retraite tout Inbound vers Output (même arborescence),
-  4. attend que chaque fichier soit sorti, télécharge Output dans --download/{base,gap}/out,
-  5. affiche les commandes d'évaluation (tools/validate.sh SKIP_SANITIZE=1) — ou les lance avec --evaluate.
+  1. empties <INBOUND_PREFIX> and <OUTPUT_PREFIX> (everything: old results, e2e-* folders, files outside the dataset),
+  2. drops both datasets FLAT at the root of Inbound (only subfolder: the POC's images/) — the names do not
+     overlap; the evaluation routes each output to its dataset by membership, not by folder,
+  3. POST /scan-completed: the service reprocesses all of Inbound into Output (same directory tree),
+  4. waits until every file has come out, downloads Output into --download/{base,gap}/out,
+  5. prints the evaluation commands (tools/validate.sh SKIP_SANITIZE=1) — or runs them with --evaluate.
 
-Env : voir tools/e2e_gap.py (GRAPH_*, SP_*, SERVICE_API_KEY, SERVICE_URL, INBOUND_PREFIX, OUTPUT_PREFIX).
+Env: see tools/e2e_gap.py (GRAPH_*, SP_*, SERVICE_API_KEY, SERVICE_URL, INBOUND_PREFIX, OUTPUT_PREFIX).
 
     python tools/reset_demo.py --ds <…/02_Phase2_dataset> --download tools/runs/demo --evaluate
 """
@@ -38,7 +39,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ds", required=True, help="dossier 02_Phase2_dataset (inbound/, inbound_gap/, ground_truth/)")
     ap.add_argument("--download", default="tools/runs/demo")
-    ap.add_argument("--gap-subdir", default="gap")
+    ap.add_argument("--gap-subdir", default="", help="sous-dossier du dataset d'écart dans Inbound (défaut : aucun, à plat)")
     ap.add_argument("--timeout", type=int, default=1500)
     ap.add_argument("--evaluate", action="store_true", help="lancer tools/validate.sh sur les sorties téléchargées")
     ap.add_argument("--keep", action="store_true", help="ne pas vider Inbound/Output (dépôt + retraitement seulement)")
@@ -58,37 +59,44 @@ def main():
         for folder in (inbound, output):
             items = gc.list_folder(folder)
             print("vidage", folder, ":", len(items), "fichiers")
-            # supprimer les dossiers de 1er niveau puis les fichiers restants
+            # delete the top-level folders, then the remaining files
             tops = sorted({rel.split("/")[0] for rel, _ in items})
             for t in tops:
                 print("   rm", f"{folder}/{t}", "->", gc.delete(f"{folder}/{t}"))
 
-    plan = [(os.path.join(a.ds, "inbound"), ""), (os.path.join(a.ds, "inbound_gap"), a.gap_subdir)]
-    expected = {}
-    for root, sub in plan:
+    plan = [(os.path.join(a.ds, "inbound"), "", "base"), (os.path.join(a.ds, "inbound_gap"), a.gap_subdir, "gap")]
+    expected, dataset_of = {}, {}
+    for root, sub, tag in plan:
         for rel in local_files(root):
             target = f"{sub}/{rel}" if sub else rel
+            if target in dataset_of:
+                print("ECHEC : nom en double entre les deux jeux :", target); sys.exit(2)
+            dataset_of[target] = (tag, rel)
             if not a.no_upload:
                 try:
                     gc.upload(f"{inbound}/{target}", os.path.join(root, rel))
                     print("   dépôt", f"{inbound}/{target}")
-                except requests.HTTPError as exc:       # 423 Locked : fichier ouvert dans SharePoint/Word par quelqu'un
+                except requests.HTTPError as exc:       # 423 Locked: file opened in SharePoint/Word by someone
                     if exc.response is not None and exc.response.status_code == 423:
                         print("   VERROUILLÉ (ouvert côté SharePoint ?), copie Inbound existante conservée :", target)
                     else:
                         raise
             expected[target] = os.path.getsize(os.path.join(root, rel))
+    processed_before = requests.get(f"{url}/healthz", timeout=30).json().get("processed", 0)
     if not a.no_upload:
         print("Inbound :", len(expected), "fichiers ; POST /scan-completed")
         r = requests.post(f"{url}/scan-completed", headers={"X-Api-Key": key}, json={"scan_id": "reset-demo"}, timeout=60)
         print("  ->", r.status_code, r.text[:200])
 
-    # 1) attendre la FIN du job « all » (healthz.last = {'kind': 'all'} et file vide) : avec --keep, Output contient encore
-    #    les anciennes sorties et leur simple présence ne prouve rien ; 2) puis vérifier la présence de chaque fichier
+    # 1) wait for the END of the "all" job (healthz.last = {'kind': 'all'} and empty queue): with --keep, Output still
+    #    holds the old outputs and their mere presence proves nothing; 2) then check the presence of each file
     t0 = time.time()
     while time.time() - t0 < a.timeout:
         h = requests.get(f"{url}/healthz", timeout=30).json()
-        if not h.get("queue") and (h.get("last") or {}).get("kind") == "all":
+        done = h.get("processed", 0) - processed_before
+        # the "all" job is over when the queue is empty, healthz.last says so AND this run's files were counted
+        # (a stale `last` from a previous run must not end the wait on the first poll)
+        if not h.get("queue") and (h.get("last") or {}).get("kind") == "all" and (a.no_upload or done >= len(expected)):
             break
         print("  … service en cours : processed=%s (%ds)" % (h.get("processed"), time.time() - t0)); time.sleep(20)
     else:
@@ -110,12 +118,9 @@ def main():
     print("healthz:", h)
     if pending:
         print("ECHEC : sorties manquantes", sorted(pending)); sys.exit(2)
-    base_out, gap_out = os.path.join(a.download, "base", "out"), os.path.join(a.download, "gap", "out")
     for rel in expected:
-        if rel.startswith(a.gap_subdir + "/"):
-            dst = os.path.join(gap_out, rel[len(a.gap_subdir) + 1:])
-        else:
-            dst = os.path.join(base_out, rel)
+        tag, local_rel = dataset_of[rel]
+        dst = os.path.join(a.download, tag, "out", local_rel)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         gc.download(f"{output}/{rel}", dst)
     print("téléchargé dans", a.download)

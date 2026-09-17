@@ -1,32 +1,32 @@
-# Déploiement navi (Docker Swarm + Portainer), exposé via Traefik.
-# Traefik (mode Swarm, réseau traefik_public, entrypoint websecure, resolver "le")
-# termine le TLS et route Host(masquerading.lamble.fr) → conteneur:8080.
-# Pas de port publié sur l'hôte : le trafic passe uniquement par Traefik
-# (LAN via Pi-hole → navi:443 ; Internet via le tunnel Cloudflare → Traefik).
+# navi deployment (Docker Swarm + Portainer), exposed through Traefik.
+# Traefik (Swarm mode, traefik_public network, websecure entrypoint, resolver "le")
+# terminates TLS and routes Host(masquerading.lamble.fr) → container:8080.
+# No port published on the host: traffic goes through Traefik only
+# (LAN via Pi-hole → navi:443; Internet via the Cloudflare tunnel → Traefik).
 services:
   masquerading:
     image: ghcr.io/vallamble/masquerading:latest
     volumes:
       - masquerading_data:/data
-    # Secrets Swarm existants (Portainer → Secrets), montés dans /run/secrets/<nom> ; l'application lit
-    # <VAR>_FILE (convention Docker). Aucune valeur secrète dans ce fichier ni dans les variables de la stack.
+    # Existing Swarm secrets (Portainer → Secrets), mounted at /run/secrets/<name>; the application reads
+    # <VAR>_FILE (Docker convention). No secret value in this file nor in the stack variables.
     secrets:
       - SERVICE_API_KEY
       - GRAPH_TENANT_ID
       - GRAPH_CLIENT_ID
       - GRAPH_CLIENT_SECRET
     environment:
-      # --- Auth du service (header X-Api-Key attendu des workflows Securiti) ---
+      # --- Service auth (X-Api-Key header expected from the Securiti workflows) ---
       SERVICE_API_KEY_FILE: /run/secrets/SERVICE_API_KEY
-      # --- Microsoft Graph app-only (app Entra Sites.Selected sur le site racine) ---
+      # --- Microsoft Graph app-only (Entra app, Sites.Selected on the root site) ---
       GRAPH_TENANT_ID_FILE: /run/secrets/GRAPH_TENANT_ID
       GRAPH_CLIENT_ID_FILE: /run/secrets/GRAPH_CLIENT_ID
       GRAPH_CLIENT_SECRET_FILE: /run/secrets/GRAPH_CLIENT_SECRET
-      # --- Cible SharePoint (site racine du tenant → SP_SITE_PATH vide) ---
+      # --- SharePoint target (tenant root site → empty SP_SITE_PATH) ---
       SP_HOSTNAME: "m365x42057173.sharepoint.com"
       SP_SITE_PATH: ""
       SP_LIBRARY: "Documents"
-      # --- Chemins d'état (le volume contient déjà /data/mapping_by_value.csv) ---
+      # --- State paths (the volume already contains /data/mapping_by_value.csv) ---
       DATA_DIR: "/data"
       INBOUND_PREFIX: "Documents/Inbound"
       OUTPUT_PREFIX: "Documents/Output"
@@ -49,7 +49,7 @@ services:
         - "traefik.http.routers.masquerading.entrypoints=websecure"
         - "traefik.http.routers.masquerading.tls=true"
         - "traefik.http.routers.masquerading.tls.certresolver=le"
-        # En mode Swarm, le port cible du conteneur est obligatoire en label.
+        # In Swarm mode, the container target port is mandatory as a label.
         - "traefik.http.services.masquerading.loadbalancer.server.port=8080"
 
 secrets:

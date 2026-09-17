@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-e2e_gap.py — bout-en-bout d'un dataset (POC ou écart) contre le service déployé.
+e2e_gap.py — end-to-end run of a dataset (POC or gap) against the deployed service.
 
-  1. dépose les fichiers de <inbound> (sous-dossiers compris, ex. images/) dans <INBOUND_PREFIX>/<subdir>/ via Graph
-     (mêmes credentials que la stack Portainer),
-  2. POST /sanitize pour chacun (X-Api-Key),
-  3. attend et vérifie leur présence dans <OUTPUT_PREFIX>/<subdir>/ (taille, delta), télécharge la sortie dans --download
-     en conservant l'arborescence — le dossier obtenu se copie tel quel dans <run>/out pour tools/validate.sh.
+  1. drops the files from <inbound> (subfolders included, e.g. images/) into <INBOUND_PREFIX>/<subdir>/ via Graph
+     (same credentials as the Portainer stack),
+  2. POST /sanitize for each of them (X-Api-Key),
+  3. waits for and checks their presence in <OUTPUT_PREFIX>/<subdir>/ (size, delta), downloads the output into
+     --download while preserving the directory tree — the resulting folder can be copied as is into <run>/out for
+     tools/validate.sh.
 
-Env requis (copier depuis la stack Portainer, ne JAMAIS les mettre dans le dépôt) :
+Required env (copy from the Portainer stack, NEVER put them in the repository):
   GRAPH_TENANT_ID GRAPH_CLIENT_ID GRAPH_CLIENT_SECRET SP_HOSTNAME SP_SITE_PATH [SP_LIBRARY]
-  SERVICE_API_KEY  SERVICE_URL (défaut https://masquerading.lamble.fr)
-  INBOUND_PREFIX (défaut Documents/Inbound)  OUTPUT_PREFIX (défaut Documents/Output)
+  SERVICE_API_KEY  SERVICE_URL (default https://masquerading.lamble.fr)
+  INBOUND_PREFIX (default Documents/Inbound)  OUTPUT_PREFIX (default Documents/Output)
 
     python tools/e2e_gap.py --inbound-gap <…/02_Phase2_dataset/inbound>     --subdir e2e-base --download tools/runs/e2e_base/out
     python tools/e2e_gap.py --inbound-gap <…/02_Phase2_dataset/inbound_gap> --subdir e2e-gap  --download tools/runs/e2e_gap/out
@@ -39,7 +40,7 @@ def main():
     inbound = os.environ.get("INBOUND_PREFIX", "Documents/Inbound")
     output = os.environ.get("OUTPUT_PREFIX", "Documents/Output")
     gc = GraphClient()
-    files = []                                   # chemins relatifs à <inbound>, sous-dossiers compris (images/…)
+    files = []                                   # paths relative to <inbound>, subfolders included (images/…)
     for root, dirs, names in os.walk(a.inbound_gap):
         dirs[:] = sorted(d for d in dirs if not d.startswith((".", "_")))
         for n in sorted(names):
@@ -52,7 +53,8 @@ def main():
         rel = f"{a.subdir}/{fn}"
         gc.upload(f"{inbound}/{rel}", local)
         sizes[fn] = os.path.getsize(local)
-        for attempt in range(6):        # Traefik renvoie un 502/504 HTML pendant un redéploiement Swarm : on réessaie
+        r = None
+        for attempt in range(6):        # Traefik returns an HTML 502/504 during a Swarm redeploy: retry
             try:
                 r = requests.post(f"{url}/sanitize", headers={"X-Api-Key": key}, json={"file_path": f"{inbound}/{rel}"}, timeout=60)
                 body = r.json() if r.status_code < 500 else None
@@ -71,7 +73,7 @@ def main():
     while pending and time.time() - t0 < a.timeout:
         time.sleep(15)
         try:
-            present = dict(gc.list_folder(f"{output}/{a.subdir}"))   # chemin relatif -> item
+            present = dict(gc.list_folder(f"{output}/{a.subdir}"))   # relative path -> item
         except requests.HTTPError:
             present = {}
         for fn in list(pending):

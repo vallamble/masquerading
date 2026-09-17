@@ -1,7 +1,7 @@
 name: build
 
-# Sur push main : build multi-arch et push vers GHCR (latest + sha court).
-# amd64 + arm64 pour couvrir navi quelle que soit son architecture.
+# On push to main: multi-arch build and push to GHCR (latest + short sha).
+# amd64 + arm64 to cover navi whatever its architecture.
 on:
   push:
     branches: [main]

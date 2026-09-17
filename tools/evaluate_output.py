@@ -1,21 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-evaluate_output.py — Évalue un dossier Output (fichiers assainis) contre le ground truth.
+evaluate_output.py — Evaluates an Output folder (sanitized files) against the ground truth.
 
-Mesures (par document et par data_type) :
-  - FUITES : valeurs originales à pseudonymiser encore présentes (couche texte ; OCR Tesseract pour les images
-    autonomes, les images incorporées DOCX (word/media) et les images incorporées PDF (pypdf))
-  - SUBSTITUTIONS ATTENDUES présentes (si le sanitizer utilise la table mapping_by_value.csv)
-  - PHI CONSERVÉ (diagnostics/médications) toujours lisible (profil par défaut) — ou masqué si --strict
-  - SIGNIFIANCE : toutes les chaînes au format IBAN / AVS / carte trouvées dans la sortie sont valides
-    (mod-97 / EAN-13 / Luhn) et aucun placeholder (XXXX, ****, [REDACTED]) n'apparaît
-  - INTÉGRITÉ : nombre de pages PDF, paragraphes DOCX, dimensions XLSX, nombre d'images, ratio de longueur du texte
-Usage : python3 evaluate_output.py --inbound ../inbound --output <dossier Output> --ground-truth ../ground_truth [--strict]
-Sortie : rapport Markdown + JSON dans --report-dir (défaut : le dossier Output)
+Measures (per document and per data_type):
+  - LEAKS: original values to pseudonymize still present (text layer; Tesseract OCR for standalone images,
+    images embedded in DOCX (word/media) and images embedded in PDF (pypdf))
+  - EXPECTED SUBSTITUTIONS present (if the sanitizer uses the mapping_by_value.csv table)
+  - PRESERVED PHI (diagnoses/medications) still readable (default profile) — or masked with --strict
+  - MEANINGFULNESS: every string in IBAN / AHV / card format found in the output is valid
+    (mod-97 / EAN-13 / Luhn) and no placeholder (XXXX, ****, [REDACTED]) appears
+  - INTEGRITY: PDF page count, DOCX paragraphs, XLSX dimensions, image count, text length ratio
+Usage: python3 evaluate_output.py --inbound ../inbound --output <Output dir> --ground-truth ../ground_truth [--strict]
+Output: Markdown + JSON report in --report-dir (default: the Output folder)
 """
 import argparse
 import csv
-import io
 import json
 import os
 import re
@@ -34,8 +33,8 @@ WORD_TYPES = {"FIRST_NAME", "LAST_NAME", "STREET_ADDRESS", "POSTAL_CITY", "EMAIL
 
 
 def contains(hay_raw, value, dtype, is_ocr=False):
-    """Présence d'une valeur : frontières de mot pour les types textuels (évite Valentin ⊂ Valentine),
-    insensible aux espaces pour les identifiants numériques (IBAN avec/sans espaces...). L'OCR est plus tolérant."""
+    """Presence of a value: word boundaries for textual types (avoids Valentin ⊂ Valentine),
+    whitespace-insensitive for numeric identifiers (IBAN with/without spaces...). OCR is more tolerant."""
     if dtype in WORD_TYPES and not is_ocr:
         pat = r"(?<![\w])" + re.escape(collapse(value)) + r"(?![\w])"
         return re.search(pat, collapse(hay_raw)) is not None
@@ -48,7 +47,7 @@ def ocr_text(img_bytes_or_path):
     tmp = None
     if isinstance(img_bytes_or_path, (bytes, bytearray)):
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False); tmp.write(img_bytes_or_path); tmp.close(); path = tmp.name
-    # OCR sur image agrandie 2x : Tesseract confond O/0 sous ~30 px (« CH6O »), ce qui masquait des fuites
+    # OCR on a 2x upscaled image: Tesseract confuses O/0 below ~30 px ("CH6O"), which was hiding leaks
     try:
         from PIL import Image
         im = Image.open(path).convert("RGB")
@@ -83,7 +82,8 @@ def soffice_bin():
 
 
 def soffice_convert(src, fmt, outdir):
-    """Conversion LibreOffice headless avec profil utilisateur isolé (deux conversions simultanées ne se bloquent pas)."""
+    """Headless LibreOffice conversion with an isolated user profile (two simultaneous conversions do not block
+    each other)."""
     exe = soffice_bin()
     if not exe:
         raise RuntimeError("LibreOffice (soffice) introuvable — nécessaire pour l'évaluation RTF")
@@ -98,7 +98,7 @@ def soffice_convert(src, fmt, outdir):
 
 
 def docx_full_text(path):
-    """Texte DOCX : paragraphes, tableaux, en-têtes et pieds de page de chaque section (+ locs)."""
+    """DOCX text: paragraphs, tables, headers and footers of each section (+ locs)."""
     from docx import Document
     d = Document(path)
     parts, locs = [], {}
@@ -116,7 +116,7 @@ def docx_full_text(path):
 
 
 def ocr_pdf_page(page, dpi=300):
-    """Rendu de la page (rotation /Rotate appliquée) -> OCR. Utilisé pour les pages SANS couche texte (scan)."""
+    """Render of the page (/Rotate rotation applied) -> OCR. Used for pages WITHOUT a text layer (scans)."""
     pix = page.get_pixmap(dpi=dpi)
     tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False); tmp.close()
     pix.save(tmp.name)
@@ -147,8 +147,8 @@ def ink_ratio_img(path, box):
 
 
 def extract_embedded(path, depth=0):
-    """Objets imbriqués : DOCX word/embeddings/*, XLSX xl/embeddings/*, pièces jointes PDF. Retourne
-    [(nom, texte, image_texts, stats)] en évaluant récursivement (profondeur max 3)."""
+    """Embedded objects: DOCX word/embeddings/*, XLSX xl/embeddings/*, PDF attachments. Returns
+    [(name, text, image_texts, stats)], evaluating recursively (max depth 3)."""
     out = []
     if depth > 3:
         return out
@@ -180,12 +180,12 @@ def extract_embedded(path, depth=0):
 
 
 def extract(path, depth=0):
-    """Retourne dict : pages(list[str]) pour PDF, text(str), image_texts(list[str]), stats(dict),
-    locs : texte adressable par emplacement ('sheet!cell', 'paragraph:i', 'table0!r,c') pour un contrôle au plus fin."""
+    """Returns a dict: pages(list[str]) for PDF, text(str), image_texts(list[str]), stats(dict),
+    locs: text addressable by location ('sheet!cell', 'paragraph:i', 'table0!r,c') for the finest-grained check."""
     ext = os.path.splitext(path)[1].lower()
     res = {"pages": None, "text": "", "image_texts": [], "stats": {}, "locs": {}, "page_ocr": {}, "embedded": []}
     if ext == ".rtf":
-        # RTF : LibreOffice -> DOCX -> python-docx (en-têtes/pieds/tableaux compris ; l'export txt les perd)
+        # RTF: LibreOffice -> DOCX -> python-docx (headers/footers/tables included; the txt export loses them)
         tmpd = tempfile.mkdtemp(prefix="rtf_eval_")
         docx_path = soffice_convert(path, "docx", tmpd)
         res["text"], res["locs"], st = docx_full_text(docx_path)
@@ -197,7 +197,7 @@ def extract(path, depth=0):
         with pdfplumber.open(path) as pdf:
             res["pages"] = [p.extract_text() or "" for p in pdf.pages]
         res["text"] = "\n".join(res["pages"])
-        # pages sans couche texte (scan) : rendu 300 dpi -> OCR (la rotation /Rotate est appliquée par le rendu)
+        # pages without a text layer (scans): 300 dpi render -> OCR (the /Rotate rotation is applied by the render)
         try:
             import fitz
             doc = fitz.open(path)
@@ -220,8 +220,8 @@ def extract(path, depth=0):
     elif ext == ".docx":
         from docx import Document
         d = Document(path)
-        # texte complet = paragraphes + tableaux + en-têtes/pieds de chaque section (une PII « en pied de page seulement »
-        # était invisible pour l'évaluateur avant le 17.09)
+        # full text = paragraphs + tables + headers/footers of each section (a PII "in the footer only"
+        # was invisible to the evaluator before 17.09)
         res["text"], res["locs"], _st = docx_full_text(path)
         n_img = 0
         with zipfile.ZipFile(path) as z:
@@ -267,7 +267,7 @@ def main():
     a = ap.parse_args()
     rows = list(csv.DictReader(open(a.gt_csv or os.path.join(a.ground_truth, "ground_truth.csv"), encoding="utf-8")))
     docs = sorted({r["document"] for r in rows})
-    # leurres : invalides par construction, ils doivent rester intacts (mesure du sur-masquage)
+    # decoys: invalid by construction, they must remain intact (over-masking measure)
     decoy_doc, decoy_values = {}, set()
     dec_path = a.decoys or os.path.join(a.ground_truth, "decoys.csv")
     if os.path.exists(dec_path):
@@ -298,7 +298,7 @@ def main():
             continue
         ex = extract(out_path)
         ex_in = extract(in_path) if os.path.exists(in_path) else None
-        # delta de taille (exigence « même taille de fichier » : on la mesure, on ne la promet pas)
+        # size delta ("same file size" requirement: we measure it, we do not promise it)
         if os.path.exists(in_path):
             si, so = os.path.getsize(in_path), os.path.getsize(out_path)
             report["size_delta"][doc] = {"in": si, "out": so, "pct": round(100.0 * (so - si) / max(1, si), 1)}
@@ -308,10 +308,10 @@ def main():
              "image_to_pseudonymize": 0, "image_leaks": 0, "leak_examples": []}
 
         def scope_text(r):
-            """Texte du périmètre le plus fin connu pour la ligne GT (page PDF, cellule(s) XLSX, paragraphe DOCX)."""
+            """Text of the finest known scope for the GT row (PDF page, XLSX cell(s), DOCX paragraph)."""
             if r["location_type"] == "image":
                 if ex["pages"] is not None and r["page"] and int(r["page"]) in ex.get("page_ocr", {}):
-                    return ex["page_ocr"][int(r["page"])] + " " + img_txt, True     # page scannée : OCR du rendu
+                    return ex["page_ocr"][int(r["page"])] + " " + img_txt, True     # scanned page: OCR of the render
                 return img_txt, True
             if r["location_type"].startswith("embedded"):
                 return emb_txt, False
@@ -330,13 +330,13 @@ def main():
         for r in drows:
             t = r["data_type"]
             is_img = r["location_type"] == "image"
-            must_hide = r["expected_action"] == "PSEUDONYMIZE" or a.strict   # KEEP : à masquer seulement en mode strict
+            must_hide = r["expected_action"] == "PSEUDONYMIZE" or a.strict   # KEEP: to be masked only in strict mode
             hay, is_ocr = scope_text(r)
             if must_hide:
                 d["to_pseudonymize"] += 1; bump(t, "to_pseudonymize")
                 if is_img:
                     d["image_to_pseudonymize"] += 1; bump(t, "image_to_pseudonymize")
-                leaked = contains(hay, r["value"], t, is_ocr)   # toute valeur originale résiduelle dans son périmètre = fuite
+                leaked = contains(hay, r["value"], t, is_ocr)   # any residual original value within its scope = a leak
                 if leaked:
                     d["leaks"] += 1; bump(t, "leaked")
                     if is_img:
@@ -352,11 +352,11 @@ def main():
                 d["keep_expected"] += 1; bump(t, "keep_expected")
                 if contains(hay, r["value"], t, is_ocr):
                     d["keep_present"] += 1; bump(t, "keep_present")
-        # signifiance : formats valides dans la sortie.
-        # Deux corrections de mesure (15.09) : (1) l'extraction PDF colle parfois un jeton alphabétique à la fin
-        # d'un IBAN (« AT61 … 7252 CHF ») → on retente sans ce jeton avant de déclarer l'IBAN invalide ;
-        # (2) les leurres du dataset sont invalides PAR CONSTRUCTION et doivent le rester → ils sont exclus du
-        # dénominateur, sinon la métrique punit le comportement attendu.
+        # meaningfulness: valid formats in the output.
+        # Two measurement fixes (15.09): (1) PDF extraction sometimes glues an alphabetic token to the end
+        # of an IBAN ("AT61 … 7252 CHF") → retry without that token before declaring the IBAN invalid;
+        # (2) the dataset decoys are invalid BY CONSTRUCTION and must stay so → they are excluded from the
+        # denominator, otherwise the metric punishes the expected behaviour.
         full = ex["text"] + " " + " ".join(ex["image_texts"]) + " " + emb_txt + " " + " ".join(ex.get("page_ocr", {}).values())
         iban_re = re.compile(r"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{4}){2,7}(?:[ ]?[A-Z0-9]{1,4})?\b")
 
@@ -369,7 +369,7 @@ def main():
         dec_norm = {norm(x) for x in decoy_values}
         ibans = [x for x in iban_re.findall(full) if norm(x) not in dec_norm]
         ahvs = [x for x in re.findall(r"\b756\.\d{4}\.\d{4}\.\d{2}\b", full) if norm(x) not in dec_norm]
-        no_iban = iban_re.sub(" ", full)   # éviter que des fragments d'IBAN soient comptés comme « carte »
+        no_iban = iban_re.sub(" ", full)   # avoid IBAN fragments being counted as "card"
         cards = [x for x in re.findall(r"\b(?:\d{4}[ ]?){3}\d{4}\b|\b\d{4}[ ]?\d{6}[ ]?\d{5}\b", no_iban)
                  if norm(x) not in dec_norm]
         d["format_validity"] = {
@@ -379,12 +379,12 @@ def main():
             "placeholders_XXXX_etc": len(PLACEHOLDER_RE.findall(ex["text"])),
             "note": "leurres exclus du dénominateur ; IBAN avec jeton alphabétique collé (artefact d'extraction) comptés valides",
         }
-        # sur-masquage : un leurre modifié est un faux positif du sanitizer (mesure de précision)
+        # over-masking: a modified decoy is a false positive of the sanitizer (precision measure)
         touched = [x for x in decoy_doc.get(doc, []) if x and norm(x) not in norm(full)]
         d["decoys_total"] = len(decoy_doc.get(doc, []))
         d["decoys_modified"] = len(touched)
         d["decoys_modified_examples"] = touched[:10]
-        # intégrité
+        # integrity
         integ = {"output": ex["stats"]}
         if ex_in:
             integ["inbound"] = ex_in["stats"]
@@ -397,7 +397,7 @@ def main():
         d["keep_rate"] = round(d["keep_present"] / d["keep_expected"], 4) if d["keep_expected"] else None
         report["documents"][doc] = d
 
-    # signatures : encre résiduelle dans chaque boîte (objectif < 2 % de l'encre d'entrée) ; leurres graphiques intacts (± 5 %)
+    # signatures: residual ink in each box (target < 2 % of the input ink); graphic decoys intact (± 5 %)
     if a.signatures and os.path.exists(a.signatures):
         sig_rows, ok_all = [], True
         for r in csv.DictReader(open(a.signatures, encoding="utf-8")):
@@ -408,8 +408,8 @@ def main():
             vec_resid = None
             if r["file"].lower().endswith(".pdf"):
                 i_ink, o_ink = ink_ratio_pdf(ip, int(r["page"]), box), ink_ratio_pdf(op, int(r["page"]), box)
-                # contenu vectoriel/texte/image RÉSIDUEL sous le recouvrement (invisible au rendu mais présent dans le flux) :
-                # un tracé courbe ou une image non blanche dans la boîte de signature = forme du paraphe récupérable
+                # RESIDUAL vector/text/image content under the overlay (invisible in the render, present in the stream):
+                # a curved path or a non-white image inside the signature box = recoverable shape of the initials
                 if r["kind"].startswith("signature"):
                     import fitz
                     pg = fitz.open(op)[int(r["page"]) - 1]; bx = fitz.Rect(*box)
@@ -437,8 +437,8 @@ def main():
             "decoys": sum(1 for x in sig_rows if x["kind"].startswith("decoy")),
             "decoys_intact": sum(1 for x in sig_rows if x["kind"].startswith("decoy") and x.get("ok")),
             "residual_max": max([x.get("residual", 0) for x in sig_rows if x["kind"].startswith("signature")] or [0])}}
-    # cohérence multi-surfaces (#3) : pour chaque (document, valeur) présente dans ≥ 2 types d'emplacement, le pseudonyme
-    # attendu doit être présent dans CHAQUE surface (paragraphe, tableau, en-tête/pied, image, imbriqué)
+    # multi-surface coherence (#3): for each (document, value) present in ≥ 2 location types, the expected pseudonym
+    # must be present on EACH surface (paragraph, table, header/footer, image, embedded)
     coh = {}
     for doc in docs:
         out_path = os.path.join(a.output, doc)
@@ -456,7 +456,7 @@ def main():
                         "leaks_in_multi_surface_values": len(miss), "replacement_rate": d.get("replacement_rate")}
     if coh:
         report["coherence"] = coh
-    # objets imbriqués : trouvés (par l'évaluateur) vs traités (log du sanitizer, s'il existe)
+    # embedded objects: found (by the evaluator) vs processed (sanitizer log, if it exists)
     emb = {}
     for doc in docs:
         op = os.path.join(a.output, doc)
