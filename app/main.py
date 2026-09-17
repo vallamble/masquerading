@@ -86,6 +86,8 @@ def _sanitize_one(gc: GraphClient, pz, rel_path: str):
         dst = os.path.join(td, "out" + ext)
         gc.download(f"{INBOUND}/{rel_path}", src)
         summary = handler(src, dst, pz, strict=False)
+        if os.environ.get("MATCH_INPUT_SIZE", "1") == "1":      # exigence 7 : même taille de fichier (bourrage neutre)
+            summary["size_match"] = sr.match_input_size(src, dst)
         gc.upload(f"{OUTPUT}/{rel_path}", dst)
     _persist_generated(pz)
     log.info("traité %s -> %s : %s", rel_path, OUTPUT, summary)
