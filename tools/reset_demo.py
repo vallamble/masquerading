@@ -69,8 +69,14 @@ def main():
         for rel in local_files(root):
             target = f"{sub}/{rel}" if sub else rel
             if not a.no_upload:
-                gc.upload(f"{inbound}/{target}", os.path.join(root, rel))
-                print("   dépôt", f"{inbound}/{target}")
+                try:
+                    gc.upload(f"{inbound}/{target}", os.path.join(root, rel))
+                    print("   dépôt", f"{inbound}/{target}")
+                except requests.HTTPError as exc:       # 423 Locked : fichier ouvert dans SharePoint/Word par quelqu'un
+                    if exc.response is not None and exc.response.status_code == 423:
+                        print("   VERROUILLÉ (ouvert côté SharePoint ?), copie Inbound existante conservée :", target)
+                    else:
+                        raise
             expected[target] = os.path.getsize(os.path.join(root, rel))
     if not a.no_upload:
         print("Inbound :", len(expected), "fichiers ; POST /scan-completed")
