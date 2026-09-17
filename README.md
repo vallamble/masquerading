@@ -12,7 +12,7 @@ SDI scan on `Inbound` → File Insights policy → workflow → this service →
 
 | Method | Path | Body | Purpose |
 |---|---|---|---|
-| GET | `/healthz` | — | status + queue depth |
+| GET | `/healthz` | — | status, build commit (`version`), queue depth |
 | POST | `/sanitize` | `{"file_path":"…"}` **or** `{"alert":{…}}` | pseudonymize one file (202, async) |
 | POST | `/scan-completed` | `{"scan_id":"…"}` (or `{"scan":{…}}`) | re-process all of `Inbound` (202) |
 
@@ -111,7 +111,9 @@ docker stack deploy -c docker-compose.yml masquerading   # or deploy via Portain
 | Gap dataset (RTF, scanned PDF with `/Rotate 90`, DOCX with embedded XLSX + preview, PDF with attachment, signed forms) | **0 leaks / 314**, 0 decoys / 8, 3/3 signatures at 0 % residual ink, 6/6 frames and rules intact |
 | End-to-end on the deployed service (Graph upload → `POST /sanitize` → `Documents/Output/gap/`) | 6/6 files processed in < 1 min, same evaluation result as local |
 | Container image | 657 MB → 1.12 GB (LibreOffice writer, headless) |
-| In-image typography (Valery, 17.09: font size changed from word to word) | fixed: skew-corrected box heights, one size per style cluster, one family per cluster; e.g. insurance card 5/5 values at 51 px bold (was 60–81 px, mixed sans/condensed) |
+| In-image typography (Valery, 17.09: font size changed from word to word) | fixed in two passes: skew-corrected box heights, size = median of the OCR *run* (same-line neighbours), one size per style cluster, numeric-only clusters capped at the nearest letter cluster (cursive digits), OCR boxes inflated by Tesseract tightened to the ink, one family per cluster; adjacent replaced words re-flowed as a chain (single space kept, uniform shrink if the chain does not fit); erase by ink pixels so field borders and rules survive. Checked by eye on all 6 standalone images, the OLE preview, the 4 scanned pages |
+| PDF text-layer typography | replacement text uses the original span's size, baseline, base-14 font and colour (was `insert_textbox` at 0.78 × box height: 1–2 pt too high, shrunk to superscript when the pseudonym was longer); free space up to the next word is used; adjacent replaced words re-flowed (`KELLERFranz` → `KELLER Franz`) |
+| Deployed build | `GET /healthz` returns `version` = short commit SHA baked at build time (`GIT_SHA`), so the running image can be checked after each Portainer *Pull and redeploy* |
 
 Known limits, logged for review rather than processed: OLE `.bin` objects that are not Office packages, EMF/WMF previews
 of embedded objects (Word-generated), a signature drawn over text (the text under it is erased too), native RTF patching
