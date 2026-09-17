@@ -26,6 +26,7 @@ import queue
 import shutil
 import tempfile
 import threading
+import time
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -74,6 +75,21 @@ HANDLERS = {
 SUPPORTED_FORMATS = sorted(HANDLERS)
 
 
+def _stored_size(gc: GraphClient, path: str, uploaded: int, tries: int = 6, pause: float = 2.5):
+    """Taille de drive:/<path> telle que stockée par SharePoint. La réécriture d'un DOCX/XLSX est asynchrone : on relit
+    jusqu'à ce que la taille diffère de celle envoyée (ou ~15 s), puis on la considère stable."""
+    size = None
+    for _ in range(tries):
+        time.sleep(pause)
+        try:
+            size = gc.item(path).get("size")
+        except Exception:
+            continue
+        if size is not None and size != uploaded:
+            return size
+    return size
+
+
 def _sanitize_one(gc: GraphClient, pz, rel_path: str):
     """rel_path est relatif à INBOUND (ex. 'images/x.png')."""
     ext = os.path.splitext(rel_path)[1].lower()
@@ -91,23 +107,26 @@ def _sanitize_one(gc: GraphClient, pz, rel_path: str):
         if match:
             shutil.copyfile(dst, raw)
             summary["size_match"] = sr.match_input_size(src, dst)
-        item = gc.upload(f"{OUTPUT}/{rel_path}", dst) or {}
-        # SharePoint réécrit les DOCX/XLSX qu'il stocke (métadonnées de bibliothèque : +901 o constants sur nos DOCX) :
-        # la taille STOCKÉE de la sortie diffère alors de celle de l'entrée. On compense : re-bourrage à
-        # (taille d'entrée − écart observé) et nouvel envoi, deux essais au plus.
+        gc.upload(f"{OUTPUT}/{rel_path}", dst)
+        # SharePoint réécrit les DOCX/XLSX qu'il stocke (métadonnées de bibliothèque : +901 o sur nos DOCX, +8,5 Ko sur
+        # le XLSX), de façon ASYNCHRONE : la réponse de l'envoi donne encore notre taille. On relit la taille stockée
+        # quelques secondes plus tard et, si elle diffère de l'entrée, on re-bourre à (entrée − écart) et on renvoie
+        # (trois essais au plus). Journal : size_match.sharepoint.
         si = os.path.getsize(src)
-        if match and item.get("size") and item["size"] != si and summary["size_match"].get("method"):
-            for _attempt in range(2):
-                delta = item["size"] - si
-                target = si - delta
+        if match and summary["size_match"].get("method") and ext in (".docx", ".xlsx"):
+            stored = _stored_size(gc, f"{OUTPUT}/{rel_path}", os.path.getsize(dst))
+            for _attempt in range(3):
+                if stored is None or stored == si:
+                    break
+                target = si - (stored - si)
                 shutil.copyfile(raw, dst)
                 sm2 = sr.match_input_size(src, dst, target=target)
-                item = gc.upload(f"{OUTPUT}/{rel_path}", dst) or {}
+                gc.upload(f"{OUTPUT}/{rel_path}", dst)
+                new_stored = _stored_size(gc, f"{OUTPUT}/{rel_path}", os.path.getsize(dst))
                 summary["size_match"].setdefault("sharepoint", []).append(
-                    {"stored_before": si + delta, "target": target, "stored_after": item.get("size"),
+                    {"stored_before": stored, "target": target, "stored_after": new_stored,
                      "method": sm2.get("method") or sm2.get("unmatched")})
-                if item.get("size") == si:
-                    break
+                stored = new_stored
     _persist_generated(pz)
     log.info("traité %s -> %s : %s", rel_path, OUTPUT, summary)
     return summary
