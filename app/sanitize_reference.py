@@ -207,13 +207,19 @@ def tesseract_tsv(img_path, psm):
     return [r for r in rows if r.get("level") == "5" and r.get("text", "").strip()]
 
 
+_LO_FONTS = ("~/Applications/LibreOffice.app/Contents/Resources/fonts/truetype", "/Applications/LibreOffice.app/Contents/Resources/fonts/truetype")
 _FONT_FAMILIES = [
-    # (nom, candidats Linux/conteneur ..., candidats macOS ...)
-    ("sans", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf", "/Library/Fonts/Arial.ttf"),
-    ("sans-bold", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
-    ("mono", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", "/System/Library/Fonts/Menlo.ttc", "/System/Library/Fonts/Supplemental/Courier New.ttf"),
-    ("serif", "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf", "/System/Library/Fonts/Supplemental/Times New Roman.ttf"),
-    ("condensed", "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf", "/System/Library/Fonts/Supplemental/Arial Narrow.ttf"),
+    # (nom, candidats Linux/conteneur, DejaVu embarqué par LibreOffice (macOS, même métrique que le conteneur), repli macOS)
+    ("sans", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", *(d + "/DejaVuSans.ttf" for d in _LO_FONTS),
+     "/System/Library/Fonts/Supplemental/Arial.ttf", "/Library/Fonts/Arial.ttf"),
+    ("sans-bold", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", *(d + "/DejaVuSans-Bold.ttf" for d in _LO_FONTS),
+     "/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+    ("mono", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", *(d + "/DejaVuSansMono.ttf" for d in _LO_FONTS),
+     "/System/Library/Fonts/Menlo.ttc", "/System/Library/Fonts/Supplemental/Courier New.ttf"),
+    ("serif", "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf", *(d + "/DejaVuSerif.ttf" for d in _LO_FONTS),
+     "/System/Library/Fonts/Supplemental/Times New Roman.ttf"),
+    ("condensed", "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf", *(d + "/DejaVuSansCondensed.ttf" for d in _LO_FONTS),
+     "/System/Library/Fonts/Supplemental/Arial Narrow.ttf"),
 ]
 
 
@@ -227,6 +233,7 @@ def _font_candidates():
         if fam[0] in out:
             continue
         for p in fam[1:]:
+            p = os.path.expanduser(p)
             if os.path.exists(p):
                 out[fam[0]] = p; break
     if not out:
@@ -412,122 +419,119 @@ def _collect_candidates(words, pz, strict):
     return candidates
 
 
-def _line_height_hint(box, words):
-    """Hauteur/position typographiques de la LIGNE : médiane des boîtes des autres mots OCR alignés sur la même ligne.
-    Une boîte OCR isolément trop haute (29 px sur une ligne de 16 px : accent, jambage, deux mots collés) donnait un
-    pseudonyme en gros corps ; on ne s'en sert que si ≥ 2 voisins existent et que la boîte dépasse de > 20 %."""
-    if not words:
-        return None
-    x0, y0, x1, y1 = box
-    bh = max(1, y1 - y0)
-
-    def same_line(w):
-        # recouvrement vertical mutuel ≥ 60 % de la plus petite hauteur, hauteur comparable (0,5–2 ×), pas de chevauchement en x
-        ov = min(y1, w["y"] + w["h"]) - max(y0, w["y"])
-        return (ov >= 0.6 * min(bh, w["h"]) and 0.5 * bh <= w["h"] <= 2.0 * bh
-                and (w["x"] + w["w"] <= x0 or w["x"] >= x1))
-    neigh = [w for w in words if w["conf"] >= 30 and len(w["text"]) >= 2 and same_line(w)]
-    if len(neigh) < 2:
-        return None
-    # hauteur de CAPITALE de la ligne : médiane des voisins SANS jambage ni accent (leur boîte OCR = hauteur des capitales) ;
-    # une boîte OCR incluant un jambage (« Bissig », « Wyler ») ou un accent (« Stéphane ») est plus haute que la ligne.
-    plain = [w for w in neigh if not any(c in "gjpqyQçÇ" for c in w["text"]) and not any(ord(c) > 127 for c in w["text"])]
-    ref = plain if len(plain) >= 2 else neigh
-    hs = sorted(w["h"] for w in ref); tops = sorted(w["y"] for w in ref)
-    cap_h = min(hs[len(hs) // 2], bh)                 # jamais plus haut que la boîte du mot lui-même
-    top = tops[len(tops) // 2] if abs(tops[len(tops) // 2] - y0) <= 0.5 * bh else y0
-    return (top, top + cap_h)
+def _image_slope(img):
+    """|tan| de l'inclinaison des lignes de texte de l'image (profil de projection, cf. _estimate_skew des pages scannées).
+    Une image inclinée de 1,4° gonfle chaque boîte OCR de 2,4 % de sa LARGEUR : sur la même carte, un numéro de 800 px
+    « mesurait » 20 px de plus qu'un nom de 200 px et son pseudonyme sortait en corps plus gros. L'estimation par les
+    boîtes OCR elles-mêmes sous-évaluait l'angle de moitié ; celle-ci se fait sur les pixels."""
+    import math
+    try:
+        return abs(math.tan(math.radians(_estimate_skew(img.convert("L")))))
+    except Exception:
+        return 0.0
 
 
-def _fit_font_cap(ImageFont, path, cap_h):
-    """Taille telle que la hauteur des capitales (« H ») vaut cap_h : homogène sur une ligne quel que soit le mot."""
-    lo, hi, best = 6, max(8, int(cap_h * 2.5)), None
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        f = ImageFont.truetype(path, mid); bb = f.getbbox("H")
-        if bb[3] - bb[1] <= cap_h:
-            best = (f, bb[1]); lo = mid + 1
-        else:
-            hi = mid - 1
-    if best is None:
-        f = ImageFont.truetype(path, 6); best = (f, f.getbbox("H")[1])
-    return best
+def _size_clusters(sizes, ratio=1.10):
+    """Regroupe des corps (px) proches (rapport ≤ 1,10 entre voisins triés) : retourne {index: corps médian de sa grappe}.
+    Les mots d'un même style (corps de texte, titre) prennent le même corps ; deux styles distincts restent distincts."""
+    order = sorted(range(len(sizes)), key=lambda i: sizes[i])
+    out, group = {}, []
+    def flush():
+        if group:
+            med = sorted(sizes[i] for i in group)[len(group) // 2]
+            for i in group:
+                out[i] = med
+    for i in order:
+        if group and sizes[i] > sizes[group[-1]] * ratio:
+            flush(); group = []
+        group.append(i)
+    flush()
+    return out
 
 
 def _paint_candidates(img, candidates, fonts, extra_tag=None, words=None):
-    """Recouvre chaque candidat (couleur de fond locale) et écrit le pseudonyme (police/taille ajustées à l'original).
-    Taille : hauteur de la ligne (médiane des voisins) plutôt que la boîte OCR du mot seul ; famille : celle qui colle le
-    mieux à l'ensemble de l'image, un mot ne déroge que si sa propre famille réduit son erreur de largeur de > 40 %
-    (les IBAN monospace restent monospace, les noms d'un tableau gardent une seule famille). Retourne (boîtes, log)."""
+    """Recouvre chaque candidat (couleur de fond locale) et écrit le pseudonyme en respectant la typographie de l'image.
+    1. Hauteur de boîte corrigée de l'inclinaison (boîte − largeur × |pente|) : la même hauteur pour un nom court et un
+       numéro long sur la même carte. 2. Corps ajusté pour que le texte ORIGINAL (avec ses jambages/accents) remplisse
+       cette hauteur, puis homogénéisé par grappes sur toute l'image (_size_clusters) : un style = un corps.
+    3. Famille (sans / gras / mono / serif / condensé) choisie PAR GRAPPE (erreur de largeur cumulée de l'original), jamais
+       mot par mot : plus de mélange serif/gras sur une ligne. Retourne (boîtes, log)."""
     from PIL import ImageDraw, ImageFont
     draw = ImageDraw.Draw(img)
     log, done_boxes = [], []
+    slope = _image_slope(img)
 
     def overlaps(b, d):
         ix = max(0, min(b[2], d[2]) - max(b[0], d[0])); iy = max(0, min(b[3], d[3]) - max(b[1], d[1]))
         return ix * iy > 0.5 * (b[2] - b[0]) * (b[3] - b[1])
 
-    # famille par défaut de l'image : erreur de largeur cumulée sur tous les candidats
-    fam_err = {fam: 0.0 for fam in fonts}
+    # passe 1 : géométrie corrigée et ajustement par famille pour chaque candidat retenu
+    items = []
     for box, dtype, v, rep, how, conf_min in candidates:
-        bx0, by0, bx1, by1 = box
-        hint = _line_height_hint(box, words)
-        bh = (hint[1] - hint[0]) if hint else (by1 - by0)
-        for fam, path in fonts.items():
-            fam_err[fam] += _fit_font(draw, ImageFont, path, v, bx1 - bx0, bh)[1]
-    default_fam = min(fam_err, key=fam_err.get) if fam_err else "sans"
-
-    for box, dtype, v, rep, how, conf_min in candidates:
-        x0, y0, x1, y1 = box
         if any(overlaps(box, d) for d in done_boxes):
             continue   # déjà traité par une autre passe OCR
         done_boxes.append(box)
-        hint = _line_height_hint(box, words)
-        fy0, fy1 = hint if hint else (y0, y1)          # boîte typographique pour la taille/position du texte
+        x0, y0, x1, y1 = box
+        infl = min((x1 - x0) * slope, 0.5 * (y1 - y0))          # gonflement dû à l'inclinaison, réparti haut/bas
+        hc = max(4.0, (y1 - y0) - infl)
+        fits = {fam: _fit_font(draw, ImageFont, path, v, x1 - x0, hc) for fam, path in fonts.items()}
+        items.append({"box": box, "dtype": dtype, "v": v, "rep": rep, "how": how, "conf": conf_min,
+                      "infl": infl, "fits": fits})
+    if not items:
+        return done_boxes, log
+    def pick_family(idx, base):
+        # une famille ne supplante la famille de base que si elle réduit l'erreur de largeur cumulée de ≥ 25 % :
+        # DejaVu Sans et Serif ont des chasses quasi identiques, la largeur seule les départage au hasard
+        errs = {fam: sum(items[i]["fits"][fam][1] for i in idx) for fam in fonts}
+        best = min(errs, key=errs.get)
+        return best if base not in errs or errs[best] < 0.75 * errs[base] else base
+    ref_fam = pick_family(range(len(items)), "sans")          # famille de référence de l'image
+    clusters = _size_clusters([it["fits"][ref_fam][0].size for it in items])
+    # famille par grappe de corps (un style = une famille), la référence de l'image sauf écart net
+    fam_of = {}
+    for cl in set(clusters.values()):
+        fam_of[cl] = pick_family([i for i, c in clusters.items() if c == cl], ref_fam)
+
+    for i, it in enumerate(items):
+        x0, y0, x1, y1 = it["box"]; v, rep = it["v"], it["rep"]
+        fam = fam_of[clusters[i]]
+        size = max(6, int(round(clusters[i] * it["fits"][fam][0].size / max(it["fits"][ref_fam][0].size, 1))))
+        font = ImageFont.truetype(fonts[fam], size)
+        top = font.getbbox(v)[1]                            # décalage haut du rendu de l'ORIGINAL → même ligne de base
+        ty0, ty1 = int(y0 + it["infl"] / 2), int(y1 - it["infl"] / 2)   # boîte typographique (sans le gonflement)
         # couleur de fond : médiane d'une bordure autour de la boîte ; couleur d'encre : pixel le plus sombre
         pad = 3
         border = [img.getpixel((min(max(x, 0), img.width - 1), min(max(y, 0), img.height - 1)))
                   for x in range(x0 - pad, x1 + pad, 4) for y in (y0 - pad, y1 + pad)]
-        bg = tuple(sorted(c[i] for c in border)[len(border) // 2] for i in range(3)) if border else (255, 255, 255)
+        bg = tuple(sorted(c[k] for c in border)[len(border) // 2] for k in range(3)) if border else (255, 255, 255)
         inner = [img.getpixel((x, y)) for x in range(x0, x1, 3) for y in range(y0, y1, 2)]
         ink = min(inner, key=sum) if inner else (15, 15, 15)
         if sum(bg) - sum(ink) < 90:          # contraste trop faible (fond sombre) : encre par défaut lisible
             ink = (255, 255, 255) if sum(bg) < 384 else (15, 15, 15)
-        r = rep.upper() if (v.isupper() and dtype in ("FIRST_NAME", "LAST_NAME")) else rep
-        if hint:
-            # taille par la hauteur de capitale de la ligne ; famille par erreur de largeur de l'ORIGINAL à cette taille
-            fits = {}
-            for fam_, path in fonts.items():
-                f_, top_ = _fit_font_cap(ImageFont, path, fy1 - fy0)
-                fits[fam_] = (f_, abs(draw.textlength(v, font=f_) - (x1 - x0)) / max(x1 - x0, 1), top_)
-        else:
-            fits = {fam_: _fit_font(draw, ImageFont, path, v, x1 - x0, fy1 - fy0) for fam_, path in fonts.items()}
-        fam = min(fits, key=lambda k: fits[k][1])
-        if default_fam in fits and fits[fam][1] > 0.4 * fits[default_fam][1]:
-            fam = default_fam                          # pas d'écart marqué : famille de l'image
-        font, _, top = fits[fam]
+        r = rep.upper() if (v.isupper() and it["dtype"] in ("FIRST_NAME", "LAST_NAME")) else rep
 
         def is_bg(px):
-            return sum(abs(px[i] - bg[i]) for i in range(3)) < 45
+            return sum(abs(px[k] - bg[k]) for k in range(3)) < 45
         free = x1 + pad
         while free < img.width - 1 and free - x1 < max((x1 - x0) * 0.8 + 40, (x1 - x0) * 1.5):
-            if all(is_bg(img.getpixel((free, yy))) for yy in range(fy0, fy1, max(1, (fy1 - fy0) // 4))):
+            if all(is_bg(img.getpixel((free, yy))) for yy in range(ty0, max(ty0 + 1, ty1), max(1, (ty1 - ty0) // 4))):
                 free += 2
             else:
                 break
         avail = max(x1 - x0, free - pad - x0)
-        size = font.size
         while size > 6 and draw.textlength(r, font=font) > avail:
-            size -= 1; font = ImageFont.truetype(font.path, size)
+            size -= 1; font = ImageFont.truetype(fonts[fam], size)
         xr = x0 + int(draw.textlength(r, font=font)) + pad
         draw.rectangle([x0 - pad, y0 - pad, max(x1, xr) + pad, y1 + pad], fill=bg)
-        done_boxes[-1] = (x0 - pad, y0 - pad, max(x1, xr) + pad, y1 + pad)
-        draw.text((x0, fy0 - top), r, font=font, fill=ink)
-        entry = {"type": dtype, "original": v, "replacement": r, "box": box, "font": fam, "font_px": font.size, "match": how, "ocr_conf_min": conf_min}
+        done_boxes[done_boxes.index(it["box"])] = (x0 - pad, y0 - pad, max(x1, xr) + pad, y1 + pad)
+        draw.text((x0, ty0 - top), r, font=font, fill=ink)
+        entry = {"type": it["dtype"], "original": v, "replacement": r, "box": it["box"], "font": fam, "font_px": font.size,
+                 "skew": round(slope, 4), "match": it["how"], "ocr_conf_min": it["conf"]}
         if extra_tag:
             entry["tag"] = extra_tag
         log.append(entry)
     return done_boxes, log
+
 
 
 def sanitize_image_bytes(data, ext, pz: Pseudonymizer, strict=False, ocr_scale=None,
@@ -539,8 +543,8 @@ def sanitize_image_bytes(data, ext, pz: Pseudonymizer, strict=False, ocr_scale=N
     au lieu de « CH60 ») ; (2) confusions O/0, I/1, S/5… corrigées dans les jetons numériques avant détection ;
     (3) « fail-closed » : une chaîne à forme d'IBAN dont le checksum reste faux est rapprochée de la table de
     pseudonymes (distance ≤ 2) ou recouverte par un IBAN généré — jamais laissée en clair.
-    Rendu : la taille de police est ajustée pour que le texte ORIGINAL remplisse sa boîte (homogène sur la ligne) ;
-    la famille (sans / mono / serif / gras / condensé) est celle dont la largeur rendue colle le mieux à l'original.
+    Rendu (_paint_candidates) : hauteur de boîte corrigée de l'inclinaison de l'image, corps ajusté sur le texte ORIGINAL
+    puis homogénéisé par grappes sur l'image (un style = un corps), famille (sans / gras / mono / serif / condensé) par grappe.
     Signatures manuscrites : zones d'encre non lues par l'OCR près d'un libellé « Signature » ou dans le tiers bas
     → recouvertes par défaut (COVER_SIGNATURES=1), les cadres et filets sont préservés (voir _cover_signatures).
     """
