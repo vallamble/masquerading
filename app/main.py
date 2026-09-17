@@ -86,9 +86,28 @@ def _sanitize_one(gc: GraphClient, pz, rel_path: str):
         dst = os.path.join(td, "out" + ext)
         gc.download(f"{INBOUND}/{rel_path}", src)
         summary = handler(src, dst, pz, strict=False)
-        if os.environ.get("MATCH_INPUT_SIZE", "1") == "1":      # exigence 7 : même taille de fichier (bourrage neutre)
+        match = os.environ.get("MATCH_INPUT_SIZE", "1") == "1"   # exigence 7 : même taille de fichier (bourrage neutre)
+        raw = dst + ".raw"
+        if match:
+            shutil.copyfile(dst, raw)
             summary["size_match"] = sr.match_input_size(src, dst)
-        gc.upload(f"{OUTPUT}/{rel_path}", dst)
+        item = gc.upload(f"{OUTPUT}/{rel_path}", dst) or {}
+        # SharePoint réécrit les DOCX/XLSX qu'il stocke (métadonnées de bibliothèque : +901 o constants sur nos DOCX) :
+        # la taille STOCKÉE de la sortie diffère alors de celle de l'entrée. On compense : re-bourrage à
+        # (taille d'entrée − écart observé) et nouvel envoi, deux essais au plus.
+        si = os.path.getsize(src)
+        if match and item.get("size") and item["size"] != si and summary["size_match"].get("method"):
+            for _attempt in range(2):
+                delta = item["size"] - si
+                target = si - delta
+                shutil.copyfile(raw, dst)
+                sm2 = sr.match_input_size(src, dst, target=target)
+                item = gc.upload(f"{OUTPUT}/{rel_path}", dst) or {}
+                summary["size_match"].setdefault("sharepoint", []).append(
+                    {"stored_before": si + delta, "target": target, "stored_after": item.get("size"),
+                     "method": sm2.get("method") or sm2.get("unmatched")})
+                if item.get("size") == si:
+                    break
     _persist_generated(pz)
     log.info("traité %s -> %s : %s", rel_path, OUTPUT, summary)
     return summary

@@ -2244,12 +2244,12 @@ def _pad_rtf(dst, target):
     return "rtf_spaces" if len(out) == target else None
 
 
-def match_input_size(src, dst):
-    """Rend le fichier de sortie de la MÊME TAILLE que l'entrée quand la sortie est plus petite (ou compressible
-    jusqu'à l'être) : bourrage neutre propre à chaque format. Journal : {'in', 'out_before', 'out', 'method'} ;
-    'unmatched' si la sortie reste plus grosse que l'entrée (ex. image réencodée plus lourde)."""
+def match_input_size(src, dst, target=None):
+    """Rend le fichier de sortie de la MÊME TAILLE que l'entrée (ou que `target` octets) quand la sortie est plus petite
+    (ou compressible jusqu'à l'être) : bourrage neutre propre à chaque format. Journal : {'in', 'out_before', 'out',
+    'method'} ; 'unmatched' si la sortie reste plus grosse que la cible (ex. image réencodée plus lourde)."""
     ext = os.path.splitext(dst)[1].lower()
-    target = os.path.getsize(src); before = os.path.getsize(dst)
+    target = os.path.getsize(src) if target is None else int(target); before = os.path.getsize(dst)
     fn = {".pdf": _pad_pdf, ".png": _pad_png, ".jpg": _pad_jpeg, ".jpeg": _pad_jpeg, ".docx": _pad_zip, ".xlsx": _pad_zip,
           ".rtf": _pad_rtf}.get(ext)
     res = {"in": target, "out_before": before}
