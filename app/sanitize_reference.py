@@ -903,6 +903,18 @@ def _near_label(box, labels, dist=SIG_NEAR_PX):
     return False
 
 
+def _scribble_like(parts, bh):
+    """Gribouillis de signature (dents de scie, boucles) vu par les composantes : au moins un trait HAUT (≥ 50 % de la
+    hauteur du groupe) et des morceaux FINS (médiane largeur/hauteur ≤ 0,5). Du texte imprimé non lu donne des lettres à peu près
+    carrées (rapport 0,5-1), un code-barres des barres pleines de bord à bord mais un remplissage bien plus fort."""
+    if len(parts) < 3:
+        return False
+    hs = sorted(c[3] - c[1] for c in parts); ratios = sorted((c[2] - c[0]) / max(1, c[3] - c[1]) for c in parts)
+    # une dent de scie se fragmente en morceaux courts : on demande UN trait ≥ 50 % de la hauteur (le grand trait) et des
+    # morceaux majoritairement fins (médiane largeur/hauteur ≤ 0,5) — des lettres ont un rapport 0,6-1
+    return hs[-1] >= 0.5 * bh and ratios[len(ratios) // 2] <= 0.5
+
+
 def _cover_signatures(img, words, done_boxes, apply=True, force_location=False):
     """Détecteur de ZONE DE SIGNATURE (image ou rendu de page) et recouvrement ciblé.
     Candidats : composantes connexes d'encre sombre qu'aucune boîte de mot OCR ne couvre, regroupées par proximité.
@@ -930,19 +942,36 @@ def _cover_signatures(img, words, done_boxes, apply=True, force_location=False):
                 m[0], m[1], m[2], m[3] = min(m[0], c[0]), min(m[1], c[1]), max(m[2], c[2]), max(m[3], c[3]); members[i].append(c); break
         else:
             merged.append(list(c)); members.append([c])
+    # fermeture transitive : un paraphe en dents de scie lu en 4 morceaux formait 4 groupes voisins jamais réunis
+    # (chaque composante ne rejoignait que le premier groupe rencontré) → 4 rejets « aspect / no_continuous_stroke »
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(merged)):
+            for j in range(i + 1, len(merged)):
+                a, b = merged[i], merged[j]
+                if a[0] <= b[2] + 30 and a[2] >= b[0] - 30 and a[1] <= b[3] + 20 and a[3] >= b[1] - 20:
+                    merged[i] = [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]
+                    members[i] += members[j]; del merged[j]; del members[j]; changed = True; break
+            if changed:
+                break
     labels = _signature_label_boxes(words)
     log, zones = [], []
     for (x0, y0, x1, y1), parts in zip(merged, members):
         bw, bh = x1 - x0, y1 - y0
+        near = _near_label((x0, y0, x1, y1), labels)          # ≤ 250 px d'un libellé « Signature » : contexte fort
+        bottom = (y0 + y1) / 2 >= 2 * h / 3
         why = None
         if bh < 6:
             why = "line"
         elif bw < 40 or bh < 12:
             why = "too_small"
-        elif not (1.5 <= bw / bh <= 10):
-            why = "aspect"
-        elif not any((c[2] - c[0]) >= 0.5 * bw and (c[3] - c[1]) >= max(12, 0.3 * bh) for c in parts):
+        elif not (1.5 <= bw / bh <= 10) and not (near or (bottom and 1.0 <= bw / bh <= 10)):
+            why = "aspect"                    # près d'un libellé, ou compact dans le tiers bas : la forme ne disqualifie pas
+        elif not near and not any((c[2] - c[0]) >= 0.5 * bw and (c[3] - c[1]) >= max(12, 0.3 * bh) for c in parts) \
+                and not (bottom and _scribble_like(parts, bh)):
             why = "no_continuous_stroke"      # texte imprimé non lu : lettres séparées ; un paraphe est un trait continu
+            #                                   ou, dans le tiers bas, un gribouillis de traits hauts et fins (_scribble_like)
         else:
             sub = ink[y0:y1, x0:x1]
             total = int(sub.sum())
@@ -961,9 +990,20 @@ def _cover_signatures(img, words, done_boxes, apply=True, force_location=False):
             continue
         zones.append((x0, y0, x1, y1))
     draw = ImageDraw.Draw(img)
+    trusted = _trusted_words(words)
     for x0, y0, x1, y1 in zones:
-        pad = 4
+        pad = 6
         bx0, by0, bx1, by1 = max(0, x0 - pad), max(0, y0 - pad), min(w - 1, x1 + pad), min(h - 1, y1 + pad)
+        # ne pas mordre sur du texte lu (pied de page sous le paraphe, libellé au-dessus) : le rectangle est rogné
+        # au bord du mot voisin quand celui-ci est entièrement au-dessus ou en dessous de l'encre du paraphe
+        for wd in trusted:
+            wx0, wy0, wx1, wy1 = wd["x"], wd["y"], wd["x"] + wd["w"], wd["y"] + wd["h"]
+            if wx1 <= bx0 or wx0 >= bx1 or wy1 <= by0 or wy0 >= by1:
+                continue
+            if wy0 >= y1 - 2:
+                by1 = min(by1, max(y1, wy0 - 1))
+            elif wy1 <= y0 + 2:
+                by0 = max(by0, min(y0, wy1 + 1))
         border = [img.getpixel((x, y)) for x in range(bx0, bx1, 4) for y in (by0, by1)]
         bg = tuple(sorted(c[i] for c in border)[len(border) // 2] for i in range(3)) if border else tuple(int(v) for v in page_bg)
         if apply:

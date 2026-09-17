@@ -51,10 +51,27 @@ jobs: "queue.Queue[dict]" = queue.Queue()
 state = {"processed": 0, "errors": 0, "last": None}
 
 
-def _pseudonymizer():
+def _merge_seed_into_mapping():
+    """La table persistée (/data) est complétée par les lignes du seed qu'elle n'a pas encore : une valeur ajoutée au
+    seed dans le code (ex. FIRST_NAME Anne) s'applique après redéploiement sans toucher au volume."""
     if not os.path.exists(MAPPING):
         os.makedirs(DATA_DIR, exist_ok=True)
         shutil.copy(SEED_MAPPING, MAPPING)
+        return
+    with open(MAPPING, encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f)); have = {(r["data_type"], r["original_value"]) for r in rows}
+    with open(SEED_MAPPING, encoding="utf-8", newline="") as f:
+        new = [r for r in csv.DictReader(f) if (r["data_type"], r["original_value"]) not in have]
+    if new:
+        with open(MAPPING, "a", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["data_type", "original_value", "replacement_value"])
+            for r in new:
+                w.writerow({k: r[k] for k in w.fieldnames})
+        log.info("table de pseudonymes : %d ligne(s) du seed ajoutée(s)", len(new))
+
+
+def _pseudonymizer():
+    _merge_seed_into_mapping()
     pz = sr.Pseudonymizer(MAPPING)
     if os.path.exists(GENERATED):
         with open(GENERATED, encoding="utf-8") as f:
