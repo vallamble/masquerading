@@ -123,12 +123,46 @@ of embedded objects (Word-generated), a signature drawn over text (the text unde
 (LibreOffice round trip is used instead). Signature thresholds were tuned on synthetic strokes; check them on real
 signatures before a demo.
 
+## Customer requirements — evidence (2026-09-17, build `0723127`)
+
+Measured with `tools/evaluate_output.py` on two 100 % fictional datasets (POC: 9 files / 3 717 values; gap: 11 files /
+372 values), locally **and** end to end through SharePoint and the deployed service (same numbers). Every image and
+rendered PDF page was also checked by eye; the harness is blind to typography.
+
+| # | Requirement | Status | Evidence |
+|---|---|---|---|
+| 1 | Identify PII/PHI across varying formats and templates | met | 0 leaks / 3 717 + 0 / 372; same content in different templates (`Template_B.docx`, `Template_C.pdf`, `Lettre.rtf`) 0 leaks; format-valid pseudonyms (IBAN 150/150, AVS 83/83 in the 305-page PDF); non-sensitive decoys untouched 0 / 154 |
+| 2 | Mask PII in images | met | 6 standalone images, images inside DOCX (incl. the OLE preview) and PDF: 0 leaks; pseudonyms rendered in the original size, weight, slant and colour |
+| 3 | Consistent masking across free text, images, tables | met | multi-surface check: `Coherence.docx` 5 values on header + footer + image + paragraph + table, 305-page PDF 481 values on ≥ 2 surfaces, 0 leaks, identical pseudonym everywhere (deterministic mapping) |
+| 4 | Headers and footers on all pages | met | `Pied_de_page.pdf` (4 pages, PII only in header/footer) 0/16, `Pied_de_page.docx` 0/5, RTF header/footer 0/36 |
+| 5 | Handwritten and system-generated signatures | met | 3 signatures (raster, vector, PNG) at 0 % residual ink, 6/6 frames and rules intact; typed name + "Digitally signed by" line rewritten 0/20 |
+| 6 | Data in scanned images | met | 4 scanned pages (200 dpi, skewed, one `/Rotate 90`) 0/130, second OCR pass after masking finds nothing |
+| 7 | Layout unchanged, same file size (Word, PDF) | met with a caveat | 305/305 pages, 4/4 images, identical paragraph/table/sheet counts, text length ratio 0.98–1.02; replacement text in the original face, size, baseline and colour. **Size**: DOCX/XLSX ±3 %; PDF −14 % (ASCII85 → Flate re-encoding, orphan objects removed), RTF −30 % (LibreOffice rewrite) — re-encoding, not content loss. SharePoint itself adds ~10 KB of library metadata to every DOCX/XLSX it stores: compare Inbound-on-SharePoint with Output, not the local file |
+| 8 | Sensitive data in nested documents | met | XLSX embedded in DOCX (`word/embeddings`) and XLSX attached to a PDF: found = processed, 0 leaks (incl. the OLE preview image). Out of scope, logged for review: non-Office OLE `.bin`, EMF/WMF previews |
+
+Formats: PDF (text layer), DOCX, RTF, XLSX, images inside PDF, scanned images inside PDF — all covered by the two datasets above.
+
 ## Validation
 
 ```bash
 DS=<…/02_Phase2_dataset> bash tools/validate.sh          # POC dataset: expect 0 leaks / 3 717, 0 decoys / 154, 305 pages, 4 images
 DS=<…/02_Phase2_dataset> GAP=1 bash tools/validate.sh    # gap dataset (RTF, scanned PDF, embedded objects, signatures)
 python tools/make_gap_dataset.py --ds <…/02_Phase2_dataset>   # regenerate the 100 % fictional gap dataset
+
+# end to end through SharePoint and the deployed service (env: GRAPH_*, SP_*, SERVICE_API_KEY — see tools/e2e_gap.py)
+python tools/e2e_gap.py --inbound-gap <…/inbound>     --subdir e2e-base --download tools/runs/e2e_base/out
+SKIP_SANITIZE=1 RUN_DIR=tools/runs/e2e_base bash tools/validate.sh
+```
+
+## Demo state
+
+`Documents/Inbound` holds exactly the two fictional datasets: the POC files at the root (with `images/`) and the gap
+files under `gap/`. `Documents/Output` mirrors that tree with the pseudonymized files produced by the current build.
+Securiti workflows do not fire in the lab tenant, so the trigger is manual: `POST /sanitize` for one file or
+`POST /scan-completed` to reprocess all of Inbound. To rebuild that state from scratch (wipes both folders first):
+
+```bash
+python tools/reset_demo.py --ds <…/02_Phase2_dataset> --download tools/runs/demo --evaluate   # add --keep to redeposit without wiping
 ```
 
 ## Quick test
