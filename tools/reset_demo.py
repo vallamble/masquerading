@@ -42,6 +42,7 @@ def main():
     ap.add_argument("--timeout", type=int, default=1500)
     ap.add_argument("--evaluate", action="store_true", help="lancer tools/validate.sh sur les sorties téléchargées")
     ap.add_argument("--keep", action="store_true", help="ne pas vider Inbound/Output (dépôt + retraitement seulement)")
+    ap.add_argument("--no-upload", action="store_true", help="ni vidage, ni dépôt, ni POST : attendre la fin du job en cours, télécharger, évaluer")
     a = ap.parse_args()
     url = os.environ.get("SERVICE_URL", "https://masquerading.lamble.fr").rstrip("/")
     key = os.environ["SERVICE_API_KEY"]
@@ -50,10 +51,10 @@ def main():
     gc = GraphClient()
     h = requests.get(f"{url}/healthz", timeout=30).json()
     print("healthz:", h)
-    if h.get("queue"):
+    if h.get("queue") and not a.no_upload:
         print("ECHEC : la file du service n'est pas vide, attendre avant de nettoyer"); sys.exit(2)
 
-    if not a.keep:
+    if not a.keep and not a.no_upload:
         for folder in (inbound, output):
             items = gc.list_folder(folder)
             print("vidage", folder, ":", len(items), "fichiers")
@@ -67,16 +68,28 @@ def main():
     for root, sub in plan:
         for rel in local_files(root):
             target = f"{sub}/{rel}" if sub else rel
-            gc.upload(f"{inbound}/{target}", os.path.join(root, rel))
+            if not a.no_upload:
+                gc.upload(f"{inbound}/{target}", os.path.join(root, rel))
+                print("   dépôt", f"{inbound}/{target}")
             expected[target] = os.path.getsize(os.path.join(root, rel))
-            print("   dépôt", f"{inbound}/{target}")
-    print("Inbound :", len(expected), "fichiers ; POST /scan-completed")
-    r = requests.post(f"{url}/scan-completed", headers={"X-Api-Key": key}, json={"scan_id": "reset-demo"}, timeout=60)
-    print("  ->", r.status_code, r.text[:200])
+    if not a.no_upload:
+        print("Inbound :", len(expected), "fichiers ; POST /scan-completed")
+        r = requests.post(f"{url}/scan-completed", headers={"X-Api-Key": key}, json={"scan_id": "reset-demo"}, timeout=60)
+        print("  ->", r.status_code, r.text[:200])
 
-    t0 = time.time(); pending = set(expected)
+    # 1) attendre la FIN du job « all » (healthz.last = {'kind': 'all'} et file vide) : avec --keep, Output contient encore
+    #    les anciennes sorties et leur simple présence ne prouve rien ; 2) puis vérifier la présence de chaque fichier
+    t0 = time.time()
+    while time.time() - t0 < a.timeout:
+        h = requests.get(f"{url}/healthz", timeout=30).json()
+        if not h.get("queue") and (h.get("last") or {}).get("kind") == "all":
+            break
+        print("  … service en cours : processed=%s (%ds)" % (h.get("processed"), time.time() - t0)); time.sleep(20)
+    else:
+        print("ECHEC : le job all n'est pas terminé dans le délai"); sys.exit(2)
+    pending = set(expected)
     while pending and time.time() - t0 < a.timeout:
-        time.sleep(20)
+        time.sleep(5)
         try:
             present = dict(gc.list_folder(output))
         except requests.HTTPError:
@@ -91,9 +104,6 @@ def main():
     print("healthz:", h)
     if pending:
         print("ECHEC : sorties manquantes", sorted(pending)); sys.exit(2)
-    # attendre que le service ait fini d'écrire (la queue « all » compte pour un seul job)
-    while requests.get(f"{url}/healthz", timeout=30).json().get("queue"):
-        time.sleep(10)
     base_out, gap_out = os.path.join(a.download, "base", "out"), os.path.join(a.download, "gap", "out")
     for rel in expected:
         if rel.startswith(a.gap_subdir + "/"):
