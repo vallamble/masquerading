@@ -22,6 +22,11 @@ services:
       GRAPH_TENANT_ID_FILE: /run/secrets/GRAPH_TENANT_ID
       GRAPH_CLIENT_ID_FILE: /run/secrets/GRAPH_CLIENT_ID
       GRAPH_CLIENT_SECRET_FILE: /run/secrets/GRAPH_CLIENT_SECRET
+      # fallback trigger (scan-completion poller): create the three Swarm secrets, mount them below, then set the id
+      # SECURITI_POLL_DATASOURCE: "102"
+      # SECURITI_TENANT_ID_FILE: /run/secrets/SECURITI_TENANT_ID
+      # SECURITI_API_KEY_FILE: /run/secrets/SECURITI_API_KEY
+      # SECURITI_API_SECRET_FILE: /run/secrets/SECURITI_API_SECRET
       # --- SharePoint target (tenant root site → empty SP_SITE_PATH) ---
       SP_HOSTNAME: "m365x42057173.sharepoint.com"
       SP_SITE_PATH: ""

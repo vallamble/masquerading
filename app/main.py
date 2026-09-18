@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import queue
+import requests
 import shutil
 import tempfile
 import threading
@@ -186,6 +187,77 @@ def worker():
 
 
 threading.Thread(target=worker, daemon=True).start()
+
+
+# --- Fallback trigger: poll Securiti for completed discovery scans -----------------------------------------------------
+# The Securiti workflows (Policy Alert / Discovery Scan Trigger) never fired on the lab tenant. When
+# SECURITI_POLL_DATASOURCE is set, the service itself watches the tenant's scan listing (the same stored query the
+# console uses) and reprocesses all of Inbound each time a NEW scan job on that data system reaches
+# "Post-Processing Complete". Read-only API key; job ids already seen are persisted in DATA_DIR so a restart does
+# not replay old scans. The first pass only records the baseline.
+SECURITI_TENANT_URL = os.environ.get("SECURITI_TENANT_URL", "app.securiti.ai")
+SECURITI_TENANT_ID = secret("SECURITI_TENANT_ID", default="")
+SECURITI_API_KEY = secret("SECURITI_API_KEY", default="")
+SECURITI_API_SECRET = secret("SECURITI_API_SECRET", default="")
+SECURITI_POLL_DATASOURCE = os.environ.get("SECURITI_POLL_DATASOURCE", "").strip()
+SECURITI_POLL_INTERVAL = max(30, int(os.environ.get("SECURITI_POLL_INTERVAL", "120")))
+SEEN_JOBS = os.path.join(DATA_DIR, "securiti_seen_jobs.json")
+
+
+def _securiti_completed_jobs():
+    """(job_id, scan_id, scan_name, finished_at_ms) of every scan definition on the watched data system whose last job
+    is complete ('Post-Processing Complete')."""
+    payload = {"name": "get_disc_scan_listing_data", "skip_cache": True, "response_config": {"format": 1},
+               "pagination": {"type": "limit-offset", "limit": 200, "offset": 0}, "order_by": ["-scan_created_date"]}
+    headers = {"X-API-KEY": SECURITI_API_KEY, "X-API-SECRET": SECURITI_API_SECRET, "X-TIDENT": SECURITI_TENANT_ID,
+               "Content-Type": "application/json", "Accept": "application/json"}
+    r = requests.post(f"https://{SECURITI_TENANT_URL}/reporting/v1/stored_queries/execute?ref=get_disc_scan_listing_data",
+                      json=payload, headers=headers, timeout=60)
+    r.raise_for_status()
+    out = []
+    for row in r.json().get("data", []) or []:
+        ids = row.get("instance_ids") or "[]"
+        ids = json.loads(ids) if isinstance(ids, str) else ids
+        if SECURITI_POLL_DATASOURCE not in {str(i) for i in ids}:
+            continue
+        if row.get("last_job_status") == 3 and row.get("last_job_sub_state") == "Post-Processing Complete" and row.get("last_job_id"):
+            out.append((row["last_job_id"], row.get("scan_id"), row.get("scan_name"), row.get("last_job_scan_time")))
+    return out
+
+
+def securiti_poller():
+    seen, first = None, True
+    if os.path.exists(SEEN_JOBS):
+        with open(SEEN_JOBS, encoding="utf-8") as f:
+            seen = set(json.load(f)); first = False
+    seen = seen or set()
+    state["securiti_poll"] = {"datasource": SECURITI_POLL_DATASOURCE, "interval_s": SECURITI_POLL_INTERVAL,
+                              "known_jobs": len(seen), "triggered": 0, "last_check": None, "last_error": None}
+    while True:
+        try:
+            done = _securiti_completed_jobs()
+            new = [j for j in done if j[0] not in seen]
+            if new and not first:
+                for jid, sid, name, ts in new:
+                    log.info("securiti poller: scan %s (%s) job %s completed -> reprocess Inbound", sid, name, jid)
+                    jobs.put({"kind": "all", "scan_id": f"securiti-scan-{sid}", "job_id": jid})
+                state["securiti_poll"]["triggered"] += len(new)
+            seen.update(j[0] for j in done)
+            first = False
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(SEEN_JOBS, "w", encoding="utf-8") as f:
+                json.dump(sorted(seen), f)
+            state["securiti_poll"].update(known_jobs=len(seen), last_check=int(time.time()), last_error=None)
+        except Exception as exc:  # noqa - the poller must survive network errors
+            log.warning("securiti poller: %s", exc)
+            state["securiti_poll"]["last_error"] = str(exc)[:200]
+        time.sleep(SECURITI_POLL_INTERVAL)
+
+
+if SECURITI_POLL_DATASOURCE and SECURITI_API_KEY and SECURITI_TENANT_ID:
+    threading.Thread(target=securiti_poller, daemon=True).start()
+elif SECURITI_POLL_DATASOURCE:
+    log.warning("SECURITI_POLL_DATASOURCE set but SECURITI_API_KEY / SECURITI_TENANT_ID missing: poller disabled")
 
 
 def _auth(x_api_key):
