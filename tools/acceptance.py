@@ -124,7 +124,12 @@ def main():
     print("== API security")
     h = requests.get(f"{url}/healthz", timeout=30).json()
     check("healthz public without file names", "path" not in json.dumps(h.get("last") or {}), json.dumps(h)[:100])
-    check("/mapping refused without key", requests.get(f"{url}/mapping", timeout=30).status_code == 401)
+    # MAPPING_PUBLIC=1 in the runner env means the deployment deliberately serves the page without a key (lab demo)
+    st = requests.get(f"{url}/mapping", timeout=30).status_code
+    if os.environ.get("MAPPING_PUBLIC", "0") == "1":
+        check("/mapping public (MAPPING_PUBLIC=1, lab demo choice)", st == 200, f"status {st}")
+    else:
+        check("/mapping refused without key", st == 401, f"status {st}")
     check("/mapping served with key", requests.get(f"{url}/mapping", headers={"X-Api-Key": key}, timeout=30).status_code == 200)
     check("POST /sanitize refused without key", requests.post(f"{url}/sanitize", json={"file_path": "x.pdf"}, timeout=30).status_code == 401)
     r = requests.post(f"{url}/sanitize", headers={"X-Api-Key": key}, json={"file_path": "Inbound/../Output/x.pdf"}, timeout=30)
