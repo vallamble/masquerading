@@ -58,8 +58,12 @@ def _merge_seed_into_mapping():
     seed in the code (e.g. FIRST_NAME Anne) applies after redeployment without touching the volume."""
     if not os.path.exists(MAPPING):
         os.makedirs(DATA_DIR, exist_ok=True)
+        if not os.path.exists(SEED_MAPPING):
+            raise RuntimeError(f"no pseudonym table: neither {MAPPING} nor the seed {SEED_MAPPING} exists (set SEED_MAPPING)")
         shutil.copy(SEED_MAPPING, MAPPING)
         return
+    if not os.path.exists(SEED_MAPPING):
+        return                                              # persisted table only, no seed to merge (local runs)
     with open(MAPPING, encoding="utf-8", newline="") as f:
         rows = list(csv.DictReader(f)); have = {(r["data_type"], r["original_value"]) for r in rows}
     with open(SEED_MAPPING, encoding="utf-8", newline="") as f:
