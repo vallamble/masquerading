@@ -12,7 +12,7 @@ e2e_gap.py — end-to-end run of a dataset (POC or gap) against the deployed ser
 Required env (copy from the Portainer stack, NEVER put them in the repository):
   GRAPH_TENANT_ID GRAPH_CLIENT_ID GRAPH_CLIENT_SECRET SP_HOSTNAME SP_SITE_PATH [SP_LIBRARY]
   SERVICE_API_KEY  SERVICE_URL (default https://masquerading.lamble.fr)
-  INBOUND_PREFIX (default Documents/Inbound)  OUTPUT_PREFIX (default Documents/Output)
+  INBOUND_PREFIX (default Inbound)  OUTPUT_PREFIX (default Output)
 
     python tools/e2e_gap.py --inbound-gap <…/02_Phase2_dataset/inbound>     --subdir e2e-base --download tools/runs/e2e_base/out
     python tools/e2e_gap.py --inbound-gap <…/02_Phase2_dataset/inbound_gap> --subdir e2e-gap  --download tools/runs/e2e_gap/out
@@ -37,8 +37,8 @@ def main():
     a = ap.parse_args()
     url = os.environ.get("SERVICE_URL", "https://masquerading.lamble.fr").rstrip("/")
     key = os.environ["SERVICE_API_KEY"]
-    inbound = os.environ.get("INBOUND_PREFIX", "Documents/Inbound")
-    output = os.environ.get("OUTPUT_PREFIX", "Documents/Output")
+    inbound = os.environ.get("INBOUND_PREFIX", "Inbound")
+    output = os.environ.get("OUTPUT_PREFIX", "Output")
     gc = GraphClient()
     files = []                                   # paths relative to <inbound>, subfolders included (images/…)
     for root, dirs, names in os.walk(a.inbound_gap):

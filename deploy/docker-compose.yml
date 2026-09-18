@@ -35,8 +35,8 @@ services:
       SP_LIBRARY: "Documents"
       # --- State paths (the volume already contains /data/mapping_by_value.csv) ---
       DATA_DIR: "/data"
-      INBOUND_PREFIX: "Documents/Inbound"
-      OUTPUT_PREFIX: "Documents/Output"
+      INBOUND_PREFIX: "Inbound"
+      OUTPUT_PREFIX: "Output"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
       interval: 30s

@@ -1,9 +1,9 @@
 # masquerading
 
 HTTP service for **meaningful masking / pseudonymization** in a Securiti × SharePoint PoC.
-It consistently pseudonymizes files dropped in a SharePoint `Documents/Inbound` folder — same
+It consistently pseudonymizes files dropped in a SharePoint `Inbound` folder — same
 people → same pseudonyms, format-valid IBAN/AVS/cards, in-image text rewritten via OCR — and
-writes the result to `Documents/Output`. All test data is 100 % fictional.
+writes the result to `Output`. All test data is 100 % fictional.
 
 Triggered by Securiti Workflows (HTTP Request node, executed in the Securiti cloud):
 SDI scan on `Inbound` → File Insights policy → workflow → this service → verification scan.
@@ -144,7 +144,7 @@ docker stack deploy -c docker-compose.yml masquerading   # or deploy via Portain
 |---|---|
 | POC dataset (9 files, 4 522 ground-truth rows) | **0 leaks / 3 717**, 0 decoys modified / 154, 305 pages and 4 images preserved, 1 min 19 |
 | Gap dataset (RTF, scanned PDF with `/Rotate 90`, DOCX with embedded XLSX + preview, PDF with attachment, signed forms) | **0 leaks / 314**, 0 decoys / 8, 3/3 signatures at 0 % residual ink, 6/6 frames and rules intact |
-| End-to-end on the deployed service (Graph upload → `POST /sanitize` → `Documents/Output/gap/`) | 6/6 files processed in < 1 min, same evaluation result as local |
+| End-to-end on the deployed service (Graph upload → `POST /sanitize` → `Output/gap/`) | 6/6 files processed in < 1 min, same evaluation result as local |
 | Container image | 657 MB → 1.12 GB (LibreOffice writer, headless) |
 | In-image typography (Valery, 17.09: font size changed from word to word) | fixed in two passes: skew-corrected box heights, size = median of the OCR *run* (same-line neighbours), one size per style cluster, numeric-only clusters capped at the nearest letter cluster (cursive digits), OCR boxes inflated by Tesseract tightened to the ink, one family per cluster; adjacent replaced words re-flowed as a chain (single space kept, uniform shrink if the chain does not fit); erase by ink pixels so field borders and rules survive. Checked by eye on all 6 standalone images, the OLE preview, the 4 scanned pages |
 | PDF text-layer typography | replacement text uses the original span's size, baseline and colour, and the **same TrueType face** when the source font is DejaVu (Sans / Serif / Mono × Bold × Oblique, from `fonts-dejavu` in the container), base-14 otherwise (was `insert_textbox` in Helvetica at 0.78 × box height: visibly different face, 1–2 pt too high, shrunk to superscript when the pseudonym was longer); embedded fonts are subset before saving; free space up to the next word is used; adjacent replaced words re-flowed (`KELLERFranz` → `KELLER Franz`) |
@@ -208,11 +208,18 @@ SKIP_SANITIZE=1 RUN_DIR=tools/runs/e2e_base bash tools/validate.sh
 
 ## Demo state
 
-`Documents/Inbound` holds exactly the two fictional datasets, flat: the 4 POC documents and the 11 gap files at the
-root, the 5 POC images under `images/`. `Documents/Output` mirrors that tree with the pseudonymized files produced by
+`Inbound` and `Output` sit at the root of the "Documents" library (`INBOUND_PREFIX=Inbound`,
+`OUTPUT_PREFIX=Output`), where they inherit the site permissions. They were first nested under a shared
+`Documents/` folder: every item there carried unique permissions, which made Purview's "content shared inside
+the organization" DLP condition true, and the *U.S. Financial Data — low volume* rule then restricted access to
+the one PDF holding 23 card numbers (`AccessDenied type=accessremoved` for regular users, invisible in the folder
+listing, while Graph still saw it). Root folders that nobody shares avoid the rule without touching Purview.
+`Inbound` holds exactly the two fictional datasets, flat: the 4 POC documents and the 11 gap files at the
+root, the 5 POC images under `images/`. `Output` mirrors that tree with the pseudonymized files produced by
 the current build.
-Securiti workflows do not fire in the lab tenant, so the trigger is manual: `POST /sanitize` for one file or
-`POST /scan-completed` to reprocess all of Inbound. To rebuild that state from scratch (wipes both folders first):
+The Securiti trigger is the `SAN-fallback` workflow in Cron mode (every 5 min, Discovery Scan Trigger on
+data source 102 → `POST /scan-completed`); `POST /sanitize` for one file or `POST /scan-completed` to reprocess
+all of Inbound remain available by hand. To rebuild that state from scratch (wipes both folders first):
 
 ```bash
 python tools/reset_demo.py --ds <…/02_Phase2_dataset> --download tools/runs/demo --evaluate   # add --keep to redeposit without wiping
@@ -224,5 +231,5 @@ python tools/reset_demo.py --ds <…/02_Phase2_dataset> --download tools/runs/de
 curl -fsS https://masquerading.lamble.fr/healthz
 curl -fsS -XPOST https://masquerading.lamble.fr/sanitize \
   -H "X-Api-Key: $SERVICE_API_KEY" -H 'Content-Type: application/json' \
-  -d '{"file_path":"Documents/Inbound/Dossier_patients_Q3_2026_FICTIF.pdf"}'
+  -d '{"file_path":"Inbound/Dossier_patients_Q3_2026_FICTIF.pdf"}'
 ```
