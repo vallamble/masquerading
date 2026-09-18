@@ -22,6 +22,8 @@ services:
       GRAPH_TENANT_ID_FILE: /run/secrets/GRAPH_TENANT_ID
       GRAPH_CLIENT_ID_FILE: /run/secrets/GRAPH_CLIENT_ID
       GRAPH_CLIENT_SECRET_FILE: /run/secrets/GRAPH_CLIENT_SECRET
+      # lab demo only: serve GET /mapping (the re-identification table) without the API key; remove in production
+      MAPPING_PUBLIC: "1"
       # fallback trigger (scan-completion poller): create the three Swarm secrets, mount them below, then set the id
       # SECURITI_POLL_DATASOURCE: "102"
       # SECURITI_TENANT_ID_FILE: /run/secrets/SECURITI_TENANT_ID
