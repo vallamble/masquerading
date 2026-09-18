@@ -1,8 +1,8 @@
 """Masquerading service (meaningful masking) — Securiti × SharePoint POC.
 
 Receives the triggers from Securiti Workflows (HTTP Request node, executed
-from the Securiti cloud) and pseudonymizes the files of Documents/Inbound
-into Documents/Output, consistently (Eduard→Franz everywhere, valid IBANs,
+from the Securiti cloud) and pseudonymizes the files of Inbound
+into Output, consistently (Eduard→Franz everywhere, valid IBANs,
 images rewritten via OCR). Processing is asynchronous (202 + worker): the
 305-page PDF + OCR takes several minutes, far beyond the timeout of an
 HTTP Request node.

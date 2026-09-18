@@ -47,8 +47,8 @@ def main():
     a = ap.parse_args()
     url = os.environ.get("SERVICE_URL", "https://masquerading.lamble.fr").rstrip("/")
     key = os.environ["SERVICE_API_KEY"]
-    inbound = os.environ.get("INBOUND_PREFIX", "Documents/Inbound")
-    output = os.environ.get("OUTPUT_PREFIX", "Documents/Output")
+    inbound = os.environ.get("INBOUND_PREFIX", "Inbound")
+    output = os.environ.get("OUTPUT_PREFIX", "Output")
     gc = GraphClient()
     h = requests.get(f"{url}/healthz", timeout=30).json()
     print("healthz:", h)

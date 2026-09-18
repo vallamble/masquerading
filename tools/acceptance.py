@@ -52,7 +52,7 @@ def main():
     a = ap.parse_args()
     url = os.environ.get("SERVICE_URL", "https://masquerading.lamble.fr").rstrip("/")
     key = os.environ["SERVICE_API_KEY"]
-    inbound, output = os.environ.get("INBOUND_PREFIX", "Documents/Inbound"), os.environ.get("OUTPUT_PREFIX", "Documents/Output")
+    inbound, output = os.environ.get("INBOUND_PREFIX", "Inbound"), os.environ.get("OUTPUT_PREFIX", "Output")
     gc = GraphClient()
     results = []
 
@@ -127,9 +127,9 @@ def main():
     check("/mapping refused without key", requests.get(f"{url}/mapping", timeout=30).status_code == 401)
     check("/mapping served with key", requests.get(f"{url}/mapping", headers={"X-Api-Key": key}, timeout=30).status_code == 200)
     check("POST /sanitize refused without key", requests.post(f"{url}/sanitize", json={"file_path": "x.pdf"}, timeout=30).status_code == 401)
-    r = requests.post(f"{url}/sanitize", headers={"X-Api-Key": key}, json={"file_path": "Documents/Inbound/../Output/x.pdf"}, timeout=30)
+    r = requests.post(f"{url}/sanitize", headers={"X-Api-Key": key}, json={"file_path": "Inbound/../Output/x.pdf"}, timeout=30)
     check("path traversal refused (422)", r.status_code == 422, r.text[:80])
-    r = requests.post(f"{url}/sanitize", headers={"X-Api-Key": key}, json={"file_path": "Documents/Inbound/x.exe"}, timeout=30)
+    r = requests.post(f"{url}/sanitize", headers={"X-Api-Key": key}, json={"file_path": "Inbound/x.exe"}, timeout=30)
     check("unsupported extension refused (422)", r.status_code == 422, r.text[:80])
     ok = sum(1 for _, o, _ in results if o)
     print("\n== %d / %d checks passed" % (ok, len(results)))
