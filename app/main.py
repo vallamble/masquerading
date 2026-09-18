@@ -265,8 +265,13 @@ elif SECURITI_POLL_DATASOURCE:
 
 
 def _auth(x_api_key):
-    """Mandatory API key, compared in constant time (no leak through the response time)."""
+    """Key required, compared in constant time (no leak through response time). On failure, log a fingerprint of what
+    was received (present or not, length, first 2 characters) — never the value — so a caller with a stale credential
+    or a wrong header name can be told apart from a caller sending nothing."""
     if not API_KEY or not hmac.compare_digest(x_api_key or "", API_KEY):
+        got = x_api_key or ""
+        log.warning("auth failed: header %s, len=%d, prefix=%r, expected len=%d",
+                    "present" if got else "absent", len(got), got[:2], len(API_KEY or ""))
         raise HTTPException(status_code=401, detail="invalid X-Api-Key")
 
 
