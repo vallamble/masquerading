@@ -51,6 +51,34 @@ API_KEY = secret("SERVICE_API_KEY", default="")   # env, SERVICE_API_KEY_FILE or
 app = FastAPI(title="masquerading", version="0.1.0")
 jobs: "queue.Queue[dict]" = queue.Queue()
 state = {"processed": 0, "errors": 0, "last": None}
+# Coalescing: while a full-Inbound job is waiting in the queue, further /scan-completed calls do not add another one
+# (a Securiti Cron cycle can emit one item per data source, i.e. a dozen POSTs for one event), and a file already
+# waiting is not queued twice.
+_pending = {"all": False, "files": set()}
+_pending_lock = threading.Lock()
+
+
+def _enqueue(job):
+    """Adds a job unless an equivalent one is already waiting. Returns (queued: bool, queue size)."""
+    with _pending_lock:
+        if job["kind"] == "all":
+            if _pending["all"]:
+                return False, jobs.qsize()
+            _pending["all"] = True
+        else:
+            if job["path"] in _pending["files"]:
+                return False, jobs.qsize()
+            _pending["files"].add(job["path"])
+        jobs.put(job)
+        return True, jobs.qsize()
+
+
+def _dequeued(job):
+    with _pending_lock:
+        if job["kind"] == "all":
+            _pending["all"] = False
+        else:
+            _pending["files"].discard(job.get("path"))
 
 
 def _merge_seed_into_mapping():
@@ -164,6 +192,7 @@ def worker():
     gc = pz = None
     while True:
         job = jobs.get()
+        _dequeued(job)                      # from here on a new identical request must be queued again
         try:
             if gc is None or pz is None:
                 gc = gc or GraphClient()
@@ -244,7 +273,7 @@ def securiti_poller():
             if new and not first:
                 for jid, sid, name, ts in new:
                     log.info("securiti poller: scan %s (%s) job %s completed -> reprocess Inbound", sid, name, jid)
-                    jobs.put({"kind": "all", "scan_id": f"securiti-scan-{sid}", "job_id": jid})
+                    _enqueue({"kind": "all", "scan_id": f"securiti-scan-{sid}", "job_id": jid})
                 state["securiti_poll"]["triggered"] += len(new)
             seen.update(j[0] for j in done)
             first = False
@@ -424,12 +453,14 @@ def sanitize(req: SanitizeReq, x_api_key: str = Header(default="")):
         raise HTTPException(status_code=422, detail="no file path found in the payload")
     rel = _safe_rel(_to_inbound_rel(path))
     log.info("POST /sanitize -> %s", rel)
-    jobs.put({"kind": "file", "path": rel})
-    return {"queued": rel, "queue": jobs.qsize()}
+    queued, size = _enqueue({"kind": "file", "path": rel})
+    return {"queued": rel, "queue": size, "coalesced": not queued}
 
 
 @app.post("/scan-completed", status_code=202)
 def scan_completed(req: ScanReq, x_api_key: str = Header(default="")):
     _auth(x_api_key)
-    jobs.put({"kind": "all", "scan_id": req.scan_id})
-    return {"queued": "all", "queue": jobs.qsize()}
+    queued, size = _enqueue({"kind": "all", "scan_id": req.scan_id})
+    if not queued:
+        log.info("POST /scan-completed coalesced: a full reprocess is already waiting")
+    return {"queued": "all", "queue": size, "coalesced": not queued}
