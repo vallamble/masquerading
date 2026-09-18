@@ -37,6 +37,9 @@ schema). POST requests require the `X-Api-Key: $SERVICE_API_KEY` header.
 | `SCAN_DPI` | render resolution for scanned PDF pages (OCR + second pass) | `300` |
 | `SOFFICE` | path to LibreOffice `soffice` (RTF conversion) | auto-detected |
 | `HMAC_SECRET` | key of the HMAC that derives pseudonyms for values absent from the table (`generated.json`); falls back to `SERVICE_API_KEY`, then to a demo constant with a start-up warning — set it in production so generated pseudonyms cannot be recomputed from the public code | — |
+| `SECURITI_POLL_DATASOURCE` | data system id to watch (e.g. `102`); when set, the service polls the tenant's scan listing and reprocesses all of `Inbound` each time a new discovery-scan job on that data system reaches "Post-Processing Complete" (fallback trigger when Securiti workflows do not fire) | — (off) |
+| `SECURITI_TENANT_URL` / `SECURITI_TENANT_ID` / `SECURITI_API_KEY` / `SECURITI_API_SECRET` | read-only API credentials for the poller (`<VAR>_FILE` / `/run/secrets` accepted) | `app.securiti.ai` / — |
+| `SECURITI_POLL_INTERVAL` | polling period in seconds (min 30) | `120` |
 | `MAPPING_PUBLIC` | `1` = serve `GET /mapping` (the original → pseudonym table, i.e. the re-identification key) without the API key — lab demos only, never in production | `0` |
 | `MATCH_INPUT_SIZE` | `1` = make every output file byte-identical in size to its input (neutral padding, see Status) ; `0` = natural size | `1` |
 | `PDF_SUBSET_FONTS` | `1` = subset the TrueType faces re-inserted in PDFs | `1` |
@@ -50,6 +53,20 @@ Persistent state: `${DATA_DIR}/mapping_by_value.csv` (pseudonym table; seed copi
 start if missing) and `${DATA_DIR}/generated.json` (unknown values, deterministic derivation).
 The service starts **without** Graph credentials (returns 202 and logs); the Graph call only
 fails inside the worker at processing time.
+
+## Triggers
+
+Three ways to start processing, from the most to the least automatic:
+
+1. **Securiti workflow** (target design): File Insights policy → Policy Alert → workflow `SAN-main` → `POST /sanitize`
+   with the alert payload; or Discovery Scan Trigger → workflow `SAN-fallback` → `POST /scan-completed`. On the lab
+   tenant neither workflow has ever executed and no policy has ever been evaluated (see the support ticket in
+   `03_results/`), so:
+2. **Scan-completion poller** (fallback, built in): with `SECURITI_POLL_DATASOURCE` set, the service watches the
+   tenant's scan listing every `SECURITI_POLL_INTERVAL` seconds and reprocesses `Inbound` when a new scan job on that
+   data system completes — the same event the Discovery Scan Trigger should react to, observed from our side.
+   `GET /healthz` shows `securiti_poll` (known jobs, triggered count, last check/error).
+3. **Manual**: `POST /sanitize` (one file) or `POST /scan-completed` (all of `Inbound`).
 
 ## Security
 
