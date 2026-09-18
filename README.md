@@ -174,6 +174,10 @@ DS=<…/02_Phase2_dataset> bash tools/validate.sh          # POC dataset: expect
 DS=<…/02_Phase2_dataset> GAP=1 bash tools/validate.sh    # gap dataset (RTF, scanned PDF, embedded objects, signatures)
 python tools/make_gap_dataset.py --ds <…/02_Phase2_dataset>   # regenerate the 100 % fictional gap dataset
 
+# acceptance of the eight requirements against what is really in SharePoint (tree, evaluator, stored sizes, fonts,
+# third-party text extraction, signature zones, italic fields, API security) — 24 checks, exit 0 when all pass
+python tools/acceptance.py --ds <…/02_Phase2_dataset> --download tools/runs/acceptance
+
 # end to end through SharePoint and the deployed service (env: GRAPH_*, SP_*, SERVICE_API_KEY — see tools/e2e_gap.py)
 python tools/e2e_gap.py --inbound-gap <…/inbound>     --subdir e2e-base --download tools/runs/e2e_base/out
 SKIP_SANITIZE=1 RUN_DIR=tools/runs/e2e_base bash tools/validate.sh
