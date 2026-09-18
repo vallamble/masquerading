@@ -62,6 +62,12 @@ Three ways to start processing, from the most to the least automatic:
    with the alert payload; or Discovery Scan Trigger → workflow `SAN-fallback` → `POST /scan-completed`. On the lab
    tenant neither workflow has ever executed and no policy has ever been evaluated (see the support ticket in
    `03_results/`), so:
+   Console findings (2026-09-18): in **Event Mode** the trigger nodes have no polling fields at all and "Execute
+   Workflow" hangs without leaving any execution; in **Cron Mode** (Operation List, Page Size, Polling Interval in
+   minutes/hours with a minimum of 1, From Date) the workflow runs on schedule and the node can be executed by hand,
+   but the target/data-source filter disappears and the List returned nothing for our completed scan even with the
+   From Date set before it. Saving an *active* workflow fails ("Active workflow cannot be updated"): deactivate,
+   save, reactivate, and keep "clear the previous state of this workflow" on when changing the From Date.
 2. **Scan-completion poller** (fallback, built in): with `SECURITI_POLL_DATASOURCE` set, the service watches the
    tenant's scan listing every `SECURITI_POLL_INTERVAL` seconds and reprocesses `Inbound` when a new scan job on that
    data system completes — the same event the Discovery Scan Trigger should react to, observed from our side.
