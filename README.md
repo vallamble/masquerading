@@ -7,8 +7,9 @@ writes the result to `Output`. All test data is 100 % fictional.
 
 Triggered by Securiti Workflows (HTTP Request node, executed in the Securiti cloud):
 SDI scan on `Inbound` → File Insights policy → workflow → this service → verification scan.
-On the lab tenant only the scan-completion trigger reaches the service, once per scan definition; the
-policy-alert path is not exposed for File Insights — see *Triggers* for what each building block can and cannot do.
+On the lab tenant the scan-completion trigger reaches the service automatically after every completed job of the
+console scan definition; the policy-alert path is not exposed for File Insights — see *Triggers* for what each
+building block can and cannot do.
 
 ## Endpoints
 
@@ -65,23 +66,27 @@ release 1.150, console audits of 2026-09-18/21):
 |---|---|---|---|
 | **File Insights policy** (100) | a *count*: the scope query is re-run on the Data Command Graph on display, nothing is stored, no alert, no finding | no — the form has no Actions section (Trigger Workflow exists only for Structured Data Insights) | 12 files in scope, `SAN-main` (Policy Alert, Event Mode) 0 executions ever |
 | **File Quarantine policy** | an *action on the file*: move to the same data system or to a central quarantine location, or e-mail | no — the three actions do not include Trigger Workflow; the service would have to watch the quarantine folder itself | unreachable: central destination refused (400 "datasource should be valid and in auth-complete state" on an authenticated connector) and the scope validator rejects `sharepoint_online_onprem` |
-| **Discovery Scan Trigger** (`SAN-fallback`) | an *event*, but "a scan definition has completed", not "a file was found" | yes — Cron Mode, Operation List; it remembers the definitions it has seen and never re-arms for later jobs of the same definition | the only link that has called the service: once per definition after a "clear previous state" (executions 16 and 963) |
+| **Discovery Scan Trigger** (`SAN-fallback`) | an *event*: "a discovery scan job has completed" on the data system | yes — **Event Mode**, provided the *scan definition itself* references the workflow (Scan Details → Responses → Trigger Workflow → Add Workflows); in Cron Mode it only lists definitions and fires once per definition | **works per job**: scan 206 job f4a67b04 completed 19:00Z, execution 989 at 19:22Z (0.6 s), service reprocessed `Inbound`, `Output` rewritten 19:22–19:25Z |
 
-So today: Securiti classifies a dropped file within one scan (proven), but nothing tells the service about it unless
-a person re-arms `SAN-fallback` or calls the API. Fully automatic "drop in `Inbound` → pseudonymized copy in `Output`"
-needs one of two things Securiti does not expose here: a Trigger Workflow action on File Insights policies, or a
-Discovery Scan Trigger that fires once per completed *job*. Both are asked for in the support ticket
-(`03_results/securiti_support_ticket_workflows.md`).
+So: Securiti classifies a dropped file within one scan, and the completion of that scan now reaches the service
+automatically, job after job. The per-file alert path (File Insights → Policy Alert → `SAN-main`) is still not exposed
+on this tenant and stays in the support ticket, together with Access Intelligence for M365. Two prerequisites for the
+automatic chain, both learned the hard way: the scan definition must be created in the console (API-created definitions
+read 0 bytes) and must list the workflow in its Responses tab (the trigger node alone is not enough — Event Mode looked
+"dead" for a week because of that); the console PATCH of a console-created scan is refused through the API
+("all mandatory rules must be selected"), so this wiring is a console step.
 
 Ways to start processing, from the most to the least automatic:
 
-1. **Securiti workflow**: `SAN-fallback` (Discovery Scan Trigger on definition 206 "POC Sanitization Console", the
-   console-created scan that actually classifies — API-created definitions read 0 bytes) → `POST /scan-completed`.
-   Fires once per definition; deactivate / reactivate with "clear the previous state" to re-arm it before a demo.
-   `SAN-main` (Policy Alert on policy 100) stays configured for the day the tenant exposes the alert path.
+1. **Securiti workflow** (automatic, per job): scan definition 206 "POC Sanitization Console" → Responses → Trigger
+   Workflow = `SAN-fallback` (Discovery Scan Trigger, Event Mode, Target Type Microsoft 365 SharePoint Online) →
+   `POST /scan-completed`. Each completed job of 206 reprocesses `Inbound`; the scan's own schedule (manual today,
+   daily possible) sets the latency. `SAN-main` (Policy Alert on policy 100) stays configured for the day the tenant
+   exposes the alert path.
 2. **Scan-completion poller** (fallback, built in): with `SECURITI_POLL_DATASOURCE` set, the service watches the
    tenant's scan listing every `SECURITI_POLL_INTERVAL` seconds and reprocesses `Inbound` when a new scan *job* on that
-   data system completes — the per-job event the Discovery Scan Trigger lacks, observed from our side.
+   data system completes — the same per-job event as above, observed from our side, for tenants where the
+   workflow path is unavailable.
    `GET /healthz` shows `securiti_poll` (known jobs, triggered count, last check/error).
 3. **Manual**: `POST /sanitize` (one file) or `POST /scan-completed` (all of `Inbound`).
 
