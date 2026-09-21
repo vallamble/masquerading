@@ -7,6 +7,8 @@ writes the result to `Output`. All test data is 100 % fictional.
 
 Triggered by Securiti Workflows (HTTP Request node, executed in the Securiti cloud):
 SDI scan on `Inbound` → File Insights policy → workflow → this service → verification scan.
+On the lab tenant only the scan-completion trigger reaches the service, once per scan definition; the
+policy-alert path is not exposed for File Insights — see *Triggers* for what each building block can and cannot do.
 
 ## Endpoints
 
@@ -56,21 +58,30 @@ fails inside the worker at processing time.
 
 ## Triggers
 
-Three ways to start processing, from the most to the least automatic:
+What each Securiti building block produces, and why only one of them has ever called this service (lab tenant,
+release 1.150, console audits of 2026-09-18/21):
 
-1. **Securiti workflow** (target design): File Insights policy → Policy Alert → workflow `SAN-main` → `POST /sanitize`
-   with the alert payload; or Discovery Scan Trigger → workflow `SAN-fallback` → `POST /scan-completed`. On the lab
-   tenant neither workflow has ever executed and no policy has ever been evaluated (see the support ticket in
-   `03_results/`), so:
-   Console findings (2026-09-18): in **Event Mode** the trigger nodes have no polling fields at all and "Execute
-   Workflow" hangs without leaving any execution; in **Cron Mode** (Operation List, Page Size, Polling Interval in
-   minutes/hours with a minimum of 1, From Date) the workflow runs on schedule and the node can be executed by hand,
-   but the target/data-source filter disappears and the List returned nothing for our completed scan even with the
-   From Date set before it. Saving an *active* workflow fails ("Active workflow cannot be updated"): deactivate,
-   save, reactivate, and keep "clear the previous state of this workflow" on when changing the From Date.
+| Building block | What it produces | Can it start a workflow? | On the lab tenant |
+|---|---|---|---|
+| **File Insights policy** (100) | a *count*: the scope query is re-run on the Data Command Graph on display, nothing is stored, no alert, no finding | no — the form has no Actions section (Trigger Workflow exists only for Structured Data Insights) | 12 files in scope, `SAN-main` (Policy Alert, Event Mode) 0 executions ever |
+| **File Quarantine policy** | an *action on the file*: move to the same data system or to a central quarantine location, or e-mail | no — the three actions do not include Trigger Workflow; the service would have to watch the quarantine folder itself | unreachable: central destination refused (400 "datasource should be valid and in auth-complete state" on an authenticated connector) and the scope validator rejects `sharepoint_online_onprem` |
+| **Discovery Scan Trigger** (`SAN-fallback`) | an *event*, but "a scan definition has completed", not "a file was found" | yes — Cron Mode, Operation List; it remembers the definitions it has seen and never re-arms for later jobs of the same definition | the only link that has called the service: once per definition after a "clear previous state" (executions 16 and 963) |
+
+So today: Securiti classifies a dropped file within one scan (proven), but nothing tells the service about it unless
+a person re-arms `SAN-fallback` or calls the API. Fully automatic "drop in `Inbound` → pseudonymized copy in `Output`"
+needs one of two things Securiti does not expose here: a Trigger Workflow action on File Insights policies, or a
+Discovery Scan Trigger that fires once per completed *job*. Both are asked for in the support ticket
+(`03_results/securiti_support_ticket_workflows.md`).
+
+Ways to start processing, from the most to the least automatic:
+
+1. **Securiti workflow**: `SAN-fallback` (Discovery Scan Trigger on definition 206 "POC Sanitization Console", the
+   console-created scan that actually classifies — API-created definitions read 0 bytes) → `POST /scan-completed`.
+   Fires once per definition; deactivate / reactivate with "clear the previous state" to re-arm it before a demo.
+   `SAN-main` (Policy Alert on policy 100) stays configured for the day the tenant exposes the alert path.
 2. **Scan-completion poller** (fallback, built in): with `SECURITI_POLL_DATASOURCE` set, the service watches the
-   tenant's scan listing every `SECURITI_POLL_INTERVAL` seconds and reprocesses `Inbound` when a new scan job on that
-   data system completes — the same event the Discovery Scan Trigger should react to, observed from our side.
+   tenant's scan listing every `SECURITI_POLL_INTERVAL` seconds and reprocesses `Inbound` when a new scan *job* on that
+   data system completes — the per-job event the Discovery Scan Trigger lacks, observed from our side.
    `GET /healthz` shows `securiti_poll` (known jobs, triggered count, last check/error).
 3. **Manual**: `POST /sanitize` (one file) or `POST /scan-completed` (all of `Inbound`).
 
