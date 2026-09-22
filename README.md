@@ -162,12 +162,12 @@ docker stack deploy -c docker-compose.yml masquerading   # or deploy via Portain
 | Gap dataset (RTF, scanned PDF with `/Rotate 90`, DOCX with embedded XLSX + preview, PDF with attachment, signed forms) | **0 leaks / 314**, 0 decoys / 8, 3/3 signatures at 0 % residual ink, 6/6 frames and rules intact |
 | End-to-end on the deployed service (Graph upload → `POST /sanitize` → `Output/gap/`) | 6/6 files processed in < 1 min, same evaluation result as local |
 | Container image | 657 MB → 1.12 GB (LibreOffice writer, headless) |
-| In-image typography (Valery, 17.09: font size changed from word to word) | fixed in two passes: skew-corrected box heights, size = median of the OCR *run* (same-line neighbours), one size per style cluster, numeric-only clusters capped at the nearest letter cluster (cursive digits), OCR boxes inflated by Tesseract tightened to the ink, one family per cluster; adjacent replaced words re-flowed as a chain (single space kept, uniform shrink if the chain does not fit); erase by ink pixels so field borders and rules survive. Checked by eye on all 6 standalone images, the OLE preview, the 4 scanned pages |
+| In-image typography (17.09: font size changed from word to word) | fixed in two passes: skew-corrected box heights, size = median of the OCR *run* (same-line neighbours), one size per style cluster, numeric-only clusters capped at the nearest letter cluster (cursive digits), OCR boxes inflated by Tesseract tightened to the ink, one family per cluster; adjacent replaced words re-flowed as a chain (single space kept, uniform shrink if the chain does not fit); erase by ink pixels so field borders and rules survive. Checked by eye on all 6 standalone images, the OLE preview, the 4 scanned pages |
 | PDF text-layer typography | replacement text uses the original span's size, baseline and colour, and the **same TrueType face** when the source font is DejaVu (Sans / Serif / Mono × Bold × Oblique, from `fonts-dejavu` in the container), base-14 otherwise (was `insert_textbox` in Helvetica at 0.78 × box height: visibly different face, 1–2 pt too high, shrunk to superscript when the pseudonym was longer); embedded fonts are subset before saving; free space up to the next word is used; adjacent replaced words re-flowed (`KELLERFranz` → `KELLER Franz`) |
 | PDF text extractable by third-party tools | pdfplumber/pdfminer read `Vincent Bi se`: the original *space glyph* between two replaced words survived redaction and sat inside the re-inserted pseudonym. Neighbouring redaction rectangles on a line are now merged (gap ≤ 0.6 × height) and same-style neighbours are written as one string with real spaces. Evaluator "replacements present" on the 305-page PDF: 0.84 → 1.00 with pdfplumber (PyMuPDF already read 100 %) |
 | File size identical to the input (requirement 7) — as stored by SharePoint | after upload the service re-reads the stored size (SharePoint rewrites Office files a few seconds later) and, if it differs, re-pads the raw output to input size minus the observed delta and re-uploads (3 attempts); logged as `size_match.sharepoint`. Final run on `b5aeb41`: 19/20 identical, XLSX 25 042 → 25 040 |
 | File size identical to the input (requirement 7) | `match_input_size()` after every handler: shrink first (font subsetting, JPEG quality ≤ original stream, zip level 9), then pad with a format-neutral element to the exact input size; logged per file as `size_match` (`method` or `unmatched`) |
-| Client fonts in PDF | Arial → Liberation Sans, Times New Roman → Liberation Serif, Courier New → Liberation Mono, Calibri → Carlito, Cambria → Caladea (same metrics, `fonts-liberation`/`fonts-crosextra-*` in the image, LibreOffice fonts on macOS); DejaVu reused as is; unembedded Helvetica/Times/Courier stay base-14 |
+| Original fonts in PDF | Arial → Liberation Sans, Times New Roman → Liberation Serif, Courier New → Liberation Mono, Calibri → Carlito, Cambria → Caladea (same metrics, `fonts-liberation`/`fonts-crosextra-*` in the image, LibreOffice fonts on macOS); DejaVu reused as is; unembedded Helvetica/Times/Courier stay base-14 |
 | Signature detector | ink groups merged transitively (a saw-tooth scribble read as 4 pieces formed 4 groups that each failed); next to a "Signature" label the shape filters no longer apply; in the bottom third a compact group passes if it looks like a scribble (one stroke ≥ 50 % of the height, thin fragments). Cover rectangle clipped against neighbouring OCR text |
 | Pseudonym table | `FIRST_NAME Anne → Aurore` added (the prescriber "Dr Anne Genoud" kept her first name); the service merges new seed rows into the persisted `/data` table at start-up, so table additions ship with the code |
 | In-image italic / "handwritten" fields | glyph slant measured on the ink of each word (shear that best aligns the stems), median per ink colour (one pen = one style) → oblique/italic variant of the family (DejaVu Sans-Oblique, Serif-Italic, Condensed-Oblique) instead of upright |
@@ -187,9 +187,9 @@ of embedded objects (Word-generated), a signature drawn over text (the text unde
 (LibreOffice round trip is used instead). Signature thresholds were tuned on synthetic strokes; check them on real
 signatures before a demo.
 
-## Customer requirements — evidence (2026-09-17, build `0723127`)
+## Requirements — evidence (2026-09-17, build `0723127`)
 
-Measured with `tools/evaluate_output.py` on two 100 % fictional datasets (POC: 9 files / 3 717 values; gap: 11 files /
+The eight requirements below are the specification this service was built against. Measured with `tools/evaluate_output.py` on two 100 % fictional datasets (POC: 9 files / 3 717 values; gap: 11 files /
 372 values), locally **and** end to end through SharePoint and the deployed service (same numbers). Every image and
 rendered PDF page was also checked by eye; the harness is blind to typography.
 
@@ -233,9 +233,11 @@ listing, while Graph still saw it). Root folders that nobody shares avoid the ru
 `Inbound` holds exactly the two fictional datasets, flat: the 4 POC documents and the 11 gap files at the
 root, the 5 POC images under `images/`. `Output` mirrors that tree with the pseudonymized files produced by
 the current build.
-The Securiti trigger is the `SAN-fallback` workflow in Cron mode (every 5 min, Discovery Scan Trigger on
-data source 102 → `POST /scan-completed`); `POST /sanitize` for one file or `POST /scan-completed` to reprocess
-all of Inbound remain available by hand. To rebuild that state from scratch (wipes both folders first):
+The Securiti trigger is the scan-completion workflow (Discovery Scan Trigger in Event Mode, referenced in the
+Responses tab of the console scan definition → `POST /scan-completed`), so every completed scan reprocesses
+`Inbound`; a fresh file dropped there shows up pseudonymized in `Output` after the next scan (56 min end to end
+on 2026-09-21, 30 of them scan time). `POST /sanitize` for one file or `POST /scan-completed` for all of
+`Inbound` remain available by hand. To rebuild the reference state from scratch (wipes both folders first):
 
 ```bash
 python tools/reset_demo.py --ds <…/02_Phase2_dataset> --download tools/runs/demo --evaluate   # add --keep to redeposit without wiping

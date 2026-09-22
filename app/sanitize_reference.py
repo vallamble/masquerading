@@ -1311,7 +1311,7 @@ def sanitize_docx(src, dst, pz, strict, _depth=0, _seen=None):
 
 # ---------------------------------------------------------------------------
 # RTF: LibreOffice conversion (RTF -> DOCX -> sanitize_docx -> RTF). "Native" variant (parse the RTF control
-# words and patch the runs in place) = production target, not coded here (see the customer gap REPORT).
+# words and patch the runs in place) = production target, not coded here (see the gap report).
 # ---------------------------------------------------------------------------
 _SOFFICE_CANDIDATES = [os.environ.get("SOFFICE", ""), "/usr/bin/soffice", "/usr/lib/libreoffice/program/soffice",
                        os.path.expanduser("~/Applications/LibreOffice.app/Contents/MacOS/soffice"),
