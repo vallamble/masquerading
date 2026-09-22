@@ -64,9 +64,9 @@ release 1.150, console audits of 2026-09-18/21):
 
 | Building block | What it produces | Can it start a workflow? | On the lab tenant |
 |---|---|---|---|
-| **File Insights policy** (100) | a *count*: the scope query is re-run on the Data Command Graph on display, nothing is stored, no alert, no finding | no — the form has no Actions section (Trigger Workflow exists only for Structured Data Insights) | 12 files in scope, `SAN-main` (Policy Alert, Event Mode) 0 executions ever |
+| **File Insights policy** (100) | a *count*: the scope query is re-run on the Data Command Graph on display, nothing is stored, no alert, no finding | no — the form has no Actions section (Trigger Workflow exists only for Structured Data Insights) | 23 files in scope, `SAN-policy-alert` (ex `SAN-main`, Policy Alert, Event Mode) 0 executions ever, now inactive |
 | **File Quarantine policy** | an *action on the file*: move to the same data system or to a central quarantine location, or e-mail | no — the three actions do not include Trigger Workflow; the service would have to watch the quarantine folder itself | unreachable: central destination refused (400 "datasource should be valid and in auth-complete state" on an authenticated connector) and the scope validator rejects `sharepoint_online_onprem` |
-| **Discovery Scan Trigger** (`SAN-fallback`) | an *event*: "a discovery scan job has completed" on the data system | yes — **Event Mode**, provided the *scan definition itself* references the workflow (Scan Details → Responses → Trigger Workflow → Add Workflows); in Cron Mode it only lists definitions and fires once per definition | **works per job**: scan 206 job f4a67b04 → execution 989 (2026-09-21); dedicated scan 232 job 69528b5e → execution 991 → `Output` rewritten 09:37–09:40Z (2026-09-22), 5 images classified by OCR |
+| **Discovery Scan Trigger** (`SAN-scan-complete`, formerly `SAN-fallback`) | an *event*: "a discovery scan job has completed" on the data system | yes — **Event Mode**, provided the *scan definition itself* references the workflow (Scan Details → Responses → Trigger Workflow → Add Workflows); in Cron Mode it only lists definitions and fires once per definition | **works per job**: scan 206 job f4a67b04 → execution 989 (2026-09-21); dedicated scan 232 job 69528b5e → execution 991 → `Output` rewritten 09:37–09:40Z (2026-09-22), 5 images classified by OCR |
 
 So: Securiti classifies a dropped file within one scan, and the completion of that scan now reaches the service
 automatically, job after job. The per-file alert path (File Insights → Policy Alert → `SAN-main`) is still not exposed
@@ -80,10 +80,10 @@ Ways to start processing, from the most to the least automatic:
 
 1. **Securiti workflow** (automatic, per job): scan definition 232 "POC Sanitization Inbound OCR" (console-created,
    scoped to The Landing / Documents / `root:/Inbound`, OCR on, daily 00:00) → Responses → Trigger
-   Workflow = `SAN-fallback` (Discovery Scan Trigger, Event Mode, Target Type Microsoft 365 SharePoint Online) →
+   Workflow = `SAN-scan-complete` (formerly `SAN-fallback`; Discovery Scan Trigger, Event Mode, Target Type Microsoft 365 SharePoint Online) →
    `POST /scan-completed`. Each completed job reprocesses `Inbound`; the daily schedule sets the latency (43 min
-   measured from job start to the last file written, images classified by Securiti's OCR included). `SAN-main` (Policy Alert on policy 100) stays configured for the day the tenant
-   exposes the alert path.
+   measured from job start to the last file written, images classified by Securiti's OCR included). `SAN-policy-alert` (formerly `SAN-main`; Policy Alert on policy 100) is kept **inactive** for the day the tenant
+   exposes the alert path. Workflows are linked to scan Responses by id: renaming them does not break the wiring.
 2. **Scan-completion poller** (fallback, built in): with `SECURITI_POLL_DATASOURCE` set, the service watches the
    tenant's scan listing every `SECURITI_POLL_INTERVAL` seconds and reprocesses `Inbound` when a new scan *job* on that
    data system completes — the same per-job event as above, observed from our side, for tenants where the
