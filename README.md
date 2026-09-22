@@ -66,7 +66,7 @@ release 1.150, console audits of 2026-09-18/21):
 |---|---|---|---|
 | **File Insights policy** (100) | a *count*: the scope query is re-run on the Data Command Graph on display, nothing is stored, no alert, no finding | no — the form has no Actions section (Trigger Workflow exists only for Structured Data Insights) | 12 files in scope, `SAN-main` (Policy Alert, Event Mode) 0 executions ever |
 | **File Quarantine policy** | an *action on the file*: move to the same data system or to a central quarantine location, or e-mail | no — the three actions do not include Trigger Workflow; the service would have to watch the quarantine folder itself | unreachable: central destination refused (400 "datasource should be valid and in auth-complete state" on an authenticated connector) and the scope validator rejects `sharepoint_online_onprem` |
-| **Discovery Scan Trigger** (`SAN-fallback`) | an *event*: "a discovery scan job has completed" on the data system | yes — **Event Mode**, provided the *scan definition itself* references the workflow (Scan Details → Responses → Trigger Workflow → Add Workflows); in Cron Mode it only lists definitions and fires once per definition | **works per job**: scan 206 job f4a67b04 completed 19:00Z, execution 989 at 19:22Z (0.6 s), service reprocessed `Inbound`, `Output` rewritten 19:22–19:25Z |
+| **Discovery Scan Trigger** (`SAN-fallback`) | an *event*: "a discovery scan job has completed" on the data system | yes — **Event Mode**, provided the *scan definition itself* references the workflow (Scan Details → Responses → Trigger Workflow → Add Workflows); in Cron Mode it only lists definitions and fires once per definition | **works per job**: scan 206 job f4a67b04 → execution 989 (2026-09-21); dedicated scan 232 job 69528b5e → execution 991 → `Output` rewritten 09:37–09:40Z (2026-09-22), 5 images classified by OCR |
 
 So: Securiti classifies a dropped file within one scan, and the completion of that scan now reaches the service
 automatically, job after job. The per-file alert path (File Insights → Policy Alert → `SAN-main`) is still not exposed
@@ -78,10 +78,11 @@ read 0 bytes) and must list the workflow in its Responses tab (the trigger node 
 
 Ways to start processing, from the most to the least automatic:
 
-1. **Securiti workflow** (automatic, per job): scan definition 206 "POC Sanitization Console" → Responses → Trigger
+1. **Securiti workflow** (automatic, per job): scan definition 232 "POC Sanitization Inbound OCR" (console-created,
+   scoped to The Landing / Documents / `root:/Inbound`, OCR on, daily 00:00) → Responses → Trigger
    Workflow = `SAN-fallback` (Discovery Scan Trigger, Event Mode, Target Type Microsoft 365 SharePoint Online) →
-   `POST /scan-completed`. Each completed job of 206 reprocesses `Inbound`; the scan's own schedule (manual today,
-   daily possible) sets the latency. `SAN-main` (Policy Alert on policy 100) stays configured for the day the tenant
+   `POST /scan-completed`. Each completed job reprocesses `Inbound`; the daily schedule sets the latency (43 min
+   measured from job start to the last file written, images classified by Securiti's OCR included). `SAN-main` (Policy Alert on policy 100) stays configured for the day the tenant
    exposes the alert path.
 2. **Scan-completion poller** (fallback, built in): with `SECURITI_POLL_DATASOURCE` set, the service watches the
    tenant's scan listing every `SECURITI_POLL_INTERVAL` seconds and reprocesses `Inbound` when a new scan *job* on that
